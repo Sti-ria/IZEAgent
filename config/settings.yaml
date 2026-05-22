@@ -1,0 +1,196 @@
+window:
+  title_keywords:
+    - "Plants vs. Zombies"
+    # - "植物大战僵尸"
+
+capture:
+  debug: true
+
+grid:
+  rows: 5
+  cols: 9
+
+  board_left: 30
+  board_top: 80
+  board_width: 735
+  board_height: 500
+  crop_padding_ratio: 0.08
+
+templates:
+  plant_dir: "assets/templates/plants"
+  threshold: 0.62
+
+cards:
+  imp_zombie:
+    name_cn: "小鬼"
+    slot: 0
+    cost: 50
+
+  conehead_zombie:
+    name_cn: "路障"
+    slot: 1
+    cost: 75
+
+  pole_vaulting_zombie:
+    name_cn: "撑杆"
+    slot: 2
+    cost: 75
+
+  buckethead_zombie:
+    name_cn: "铁桶"
+    slot: 3
+    cost: 125
+
+  bungee_zombie:
+    name_cn: "飞贼"
+    slot: 4
+    cost: 125
+
+  digger_zombie:
+    name_cn: "矿工"
+    slot: 5
+    cost: 125
+
+  ladder_zombie:
+    name_cn: "扶梯"
+    slot: 6
+    cost: 150
+
+  football_zombie:
+    name_cn: "橄榄"
+    slot: 7
+    cost: 175
+
+  dancing_zombie:
+    name_cn: "舞王"
+    slot: 8
+    cost: 350
+
+card_slots:
+  start_x: 90
+  start_y: 8
+  slot_width: 50
+  slot_height: 70
+  gap: 2
+
+board_memory:
+  enabled: true
+
+  # IZE 无尽：新一关红线左侧植物会重置，需要重新初始化 memory
+  auto_reinitialize: true
+
+  # 只检测红线左侧格子。
+  # 如果红线左侧是前 6 列，用 6；如果你实际是前 7 列，就改成 7。
+  reinit_check_cols: 5
+
+  # 新关卡检测时，只相信高置信度植物
+  reinit_min_confidence: 0.78
+
+  # 红线左侧至少看到多少个高置信度植物
+  reinit_min_confident_plants: 6
+
+  # 至少多少个格子 live 结果和 memory 不一致，才怀疑是新关
+  reinit_mismatch_cells: 6
+
+  # 连续多少帧满足上面条件，才真正 reset
+  reinit_confirm_frames: 5
+
+  # reset 后冷却时间，避免连续反复 reset
+  reinit_cooldown_seconds: 3.0
+
+  init_frames: 8
+  init_min_confidence: 0.45
+
+  # 单格变 empty：连续 4 帧确认
+  empty_confirm_frames: 4
+
+  # 多格同时变 empty：允许，但确认更久
+  bulk_empty_candidate_threshold: 5
+  bulk_empty_confirm_frames: 7
+
+  # live_label == empty 的阈值
+  empty_confidence_threshold: 0.65
+
+  # 默认不使用 raw empty，避免僵尸/子弹遮挡误删
+  allow_raw_empty: false
+  raw_empty_confidence_threshold: 0.90
+
+  # 开启空地视觉检查，避免菜单/僵尸/子弹挡住植物时误删
+  clean_empty_required: true
+  clean_empty_edge_density_max: 0.24
+  clean_empty_bright_ratio_max: 0.30
+  clean_empty_neutral_ratio_max: 0.70
+
+  # 恢复后等待 2 帧，别太大，否则会显得延迟
+  valid_frame_warmup: 2
+
+
+frame_guard:
+  enabled: true
+
+  min_std: 8.0
+  min_brightness: 8.0
+  max_brightness: 245.0
+
+  # 先关掉棋盘区域整体 overlay 检测。
+  # 它太容易把夜晚草地/大片空地误判成 menu_overlay_board。
+  board_overlay_enabled: false
+
+  # 中央区域菜单检测仍然保留，用来抓暂停菜单/选项菜单
+  pause_overlay_largest_ratio_threshold: 0.12
+  pause_gray_ratio_threshold: 0.24
+  pause_dark_ratio_threshold: 0.06
+
+
+strategy:
+  debug: true
+
+plant_classifier:
+  model_path: models/plant_cell_classifier.npz
+  unknown_threshold: 0.55
+  k: 5
+
+  class_thresholds:
+    default: 0.55
+
+    # 小喷菇容易和空格混，保留高阈值
+    puffshroom: 0.50
+
+    # 豌豆射手和双发射手长得太像，需要更严格
+    peashooter: 0.50
+    repeater: 0.50
+
+theme:
+  enabled: true
+  signatures_path: config/theme_signatures.yaml
+  max_col: 4
+
+  required_frames: 4
+  min_score: 0.86
+  min_margin: 0.06
+  max_unknown_empty: 1
+
+  log_until_locked: true
+  log_after_locked: false
+  check_after_locked: false
+
+
+board_corrector:
+  enabled: true
+  signatures_path: config/theme_signatures.yaml
+
+  # IZE 初始化阵型只看前 5 列：c0-c4
+  max_col: 4
+
+  # 如果植物可重集已经和主题配置一致，就不纠正
+  only_when_signature_mismatch: true
+
+  rules:
+    综合:
+      repeater: peashooter
+
+    输出:
+      peashooter: repeater
+
+    控制:
+      peashooter: repeater

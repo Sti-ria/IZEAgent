@@ -1,0 +1,90 @@
+ignore_for_theme:
+  - empty
+  - unknown
+  - invalid_frame
+
+support_plants:
+  - sunflower
+  - puffshroom
+
+total_cells: 25
+
+themes:
+  综合:
+    support_total: 8
+    signature_total: 17
+    plants:
+      kernelpult: 1
+      peashooter: 1
+      snowpea: 1
+      splitpea: 1
+      threepeater: 1
+      starfruit: 1
+      fumeshroom: 1
+      chomper: 2
+      squash: 1
+      potatomine: 1
+      wallnut: 1
+      torchwood: 1
+      magnetshroom: 1
+      umbrellaleaf: 1
+      spikeweed: 2
+
+  控制:
+    support_total: 8
+    signature_total: 17
+    plants:
+      kernelpult: 3
+      snowpea: 3
+      splitpea: 3
+      spikeweed: 3
+      repeater: 1
+      threepeater: 1
+      torchwood: 1
+      magnetshroom: 1
+      umbrellaleaf: 1
+
+  即死:
+    support_total: 8
+    signature_total: 17
+    plants:
+      fumeshroom: 4
+      potatomine: 4
+      chomper: 3
+      squash: 3
+      spikeweed: 3
+
+  输出:
+    support_total: 8
+    signature_total: 17
+    plants:
+      snowpea: 9
+      splitpea: 4
+      repeater: 4
+
+  爆炸:
+    support_total: 8
+    signature_total: 17
+    plants:
+      potatomine: 9
+      chomper: 8
+
+  倾斜:
+    support_total: 8
+    signature_total: 17
+    plants:
+      spikeweed: 9
+      starfruit: 8
+
+  穿刺:
+    support_total: 8
+    signature_total: 17
+    plants:
+      fumeshroom: 9
+      magnetshroom: 8
+
+  回复:
+    support_total: 13
+    signature_total: 12
+    plants:
+      scaredyshroom: 12
