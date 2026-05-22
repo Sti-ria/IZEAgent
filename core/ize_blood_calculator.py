@@ -24,9 +24,16 @@ Coordinate convention:
 Public API:
     calc = IZEBloodCalculator()
     calc.calculate_lane(["snowpea", "repeater", "wallnut", "empty", "puffshroom"])
+    calc.calculate_lane(lane, adjacent_lanes=[upper_lane, lower_lane])
     calc.calculate_board(board_5x5_or_5x9)
 
 The calculator only uses the first 5 columns of every lane.
+Same-lane threepeater keeps the original converter behavior and is simplified
+as peashooter.  Adjacent-lane threepeater support is added on top of the
+original segmented model: calculate_board() detects threepeaters in the lanes
+immediately above and below the target lane, while calculate_lane() can accept
+adjacent_lanes explicitly.  Cross-lane threepeater damage includes both walking
+damage with corrected 6th-cell spawn geometry and bite-stage damage for all chewable plants on the firing path.
 """
 
 from __future__ import annotations
@@ -341,6 +348,19 @@ def is_bitable(idx: int) -> bool:
     return idx != EMPTY and idx not in {TDDL_4, WG_17, JG_3, DC_21}
 
 
+def is_chewable_for_threepeater(idx: int) -> bool:
+    """
+    Target-lane chewability rule for adjacent-row threepeater support.
+
+    This intentionally differs from is_bitable(): wall-nut is chewable here,
+    because a zombie eating a wall-nut in the target lane should still take
+    threepeater damage from the adjacent lane for the long chewing duration.
+    Spikeweed, potato mine and squash are excluded because they are not normal
+    chew targets for this support rule.
+    """
+    return idx != EMPTY and idx not in {DC_21, TDDL_4, WG_17}
+
+
 def is_harmless(idx: int) -> bool:
     return idx in {HJSZ_22, CLG_31, YZBHS_37, XRK_1, DC_21, JG_3}
 
@@ -385,11 +405,21 @@ class Pair:
 class Row:
     """One-lane segmented calculator."""
 
-    def __init__(self, row: Sequence[int], mode: int, *, use_modified_pole: bool = True):
+    def __init__(
+        self,
+        row: Sequence[int],
+        mode: int,
+        *,
+        use_modified_pole: bool = True,
+        external_threepeaters: Optional[Iterable[int]] = None,
+    ):
         self.raw_row: List[int] = normalize_lane(row)
         self.row: List[int] = list(self.raw_row)
         self.mode = mode
         self.use_modified_pole = use_modified_pole
+        self.external_threepeaters: List[int] = sorted(
+            int(col) for col in (external_threepeaters or []) if 0 <= int(col) <= 4
+        )
 
         self.bite = [0.0] * 6
         self.walk = [0.0] * 6
@@ -683,40 +713,90 @@ class Row:
         """
         Add scaredy-shroom damage for the single-lane IZE blood calculator.
 
-        Current rules:
-        - Base damage is the same as peashooter: self.add(1.0, start).
-        - When the zombie enters the half-cell in front of the scaredy-shroom,
-          it ducks, so the front walk segment loses that fraction of damage.
-        - Slow, ladder and football zombies do NOT make a scaredy-shroom in col i
-          duck while biting a plant in col i+1.
-        - A pole-vaulting zombie after losing its pole DOES make that scaredy-
-          shroom duck while biting the plant in col i+1.
-
-        Cross-lane zombies are intentionally ignored here.
+        Empirical project rule currently used:
+        - columns are 0..4 from left to right, and the zombie starts at the
+          middle of the virtual 6th cell;
+        - a scaredy-shroom at column start attacks only while the zombie is in
+          the interval x = start + 0.5 .. 4.5 during walking;
+          therefore walk[5] is NOT counted, and walking contribution is added
+          only to full segments walk[start+1]..walk[4];
+        - while non-pole zombies eat plants in front of it, i.e. columns
+          start+1..4, they take scaredy-shroom bite-stage damage;
+        - when the zombie eats the scaredy-shroom itself, no bite-stage damage
+          is added;
+        - pole-vaulting keeps the previous special case: after losing the pole,
+          eating the right-neighbour plant at start+1 is close enough to make
+          the scaredy-shroom hide, so that specific bite segment is skipped.
         """
-        self.add(1.0, start)
+        # Walking damage: active from x=start+0.5 to x=4.5.
+        # This deliberately excludes walk[5] (spawn 5.5 -> 4.5).
+        for i in range(start + 1, 5):
+            self.walk[i] += self.WALK_DPS
 
-        # Front-half ducking while the zombie walks from the right-neighbour
-        # cell toward this scaredy-shroom.
-        walk_idx = start + 1
-        if 0 <= walk_idx <= 5:
-            contribution = self._scaredy_walk_contribution(walk_idx)
-            hide_fraction = self._scaredy_front_hide_fraction(walk_idx)
-            self.walk[walk_idx] -= contribution * hide_fraction
+        # Bite-stage damage: no damage while the scaredy-shroom itself is eaten.
+        # For non-pole modes, all chewable plants in front of it receive damage.
+        # For pole mode, skip the immediate right-neighbour bite segment by the
+        # project special hiding rule.
+        first_bite_col = start + 1
+        if self.mode in SCAREDY_HIDE_RIGHT_BITE_MODES:
+            first_bite_col = start + 2
 
-        # Special pole case: after losing its pole, the pole zombie's biting
-        # position at the right-neighbour cell is close enough to make this
-        # scaredy-shroom duck.  This is applied before wallnut multiplication,
-        # so wallnut biting time will not accidentally include scaredy damage.
-        right_col = start + 1
-        bite_idx = start + 2
-        if (
-            self.mode in SCAREDY_HIDE_RIGHT_BITE_MODES
-            and 0 <= right_col <= 4
-            and 0 <= bite_idx <= 5
-            and not is_empty(self.row[right_col])
-        ):
-            self.bite[bite_idx] -= self.BITE_DPS
+        for col in range(first_bite_col, 5):
+            if not is_empty(self.row[col]):
+                self.bite[col + 1] += self.BITE_DPS
+
+    def add_threepeater_support_from(self, source_col: int) -> None:
+        """
+        Add damage from a threepeater in an adjacent lane.
+
+        Same-lane threepeater behavior is intentionally left as the original
+        converter behavior (threepeater -> peashooter).  This method only models
+        a threepeater from the row immediately above or below the current row.
+
+        Cross-lane geometry used here:
+        - columns are 0..4 from left to right; the zombie starts at the middle
+          of the virtual 6th cell, to the right of column 4;
+        - walking from spawn to the right boundary of column 4 is half a cell;
+        - walk[5] is later multiplied by walk_segment_factor(5)=0.5, so we add
+          WALK_DPS to walk[5] here, not 1.0, to represent that half-cell;
+        - full cells to the right of the threepeater are walk[j+1]..walk[4];
+        - the zombie remains in the threepeater firing path until the center of
+          column j, so walk[j] gets another half-cell contribution;
+        - while the zombie is eating any chewable plant on the firing path
+          (column j through column 4), bite-stage damage is also added.
+        """
+        j = int(source_col)
+        if j < 0 or j > 4:
+            return
+
+        dps = 1.0
+
+        # Spawn is at the middle of the virtual 6th cell.  The distance to the
+        # right boundary of column 4 is half a cell.  Because walk[5] is already
+        # scaled by walk_segment_factor(5)=0.5 during summation, add a full raw
+        # WALK_DPS contribution here.
+        self.walk[5] += self.WALK_DPS * dps
+
+        # Full movement cells strictly to the right of the threepeater column:
+        # to reach the right boundary of column j, use the same segment indices
+        # as Row.add() would use for a plant at column j.
+        for seg in range(j + 1, 5):
+            self.walk[seg] += self.WALK_DPS * dps
+
+        # Continue for half of column j, stopping at the threepeater's center.
+        if 0 <= j < 5:
+            self.walk[j] += 0.5 * self.WALK_DPS * dps
+
+        # Bite-stage damage on every chewable plant in the threepeater's
+        # horizontal firing path.  This mirrors Row.add(): bite index col + 1
+        # corresponds to the zombie eating the plant at self.row[col].
+        for col in range(j, 5):
+            if not is_empty(self.row[col]):
+                self.bite[col + 1] += self.BITE_DPS * dps
+
+    def add_external_threepeaters(self) -> None:
+        for col in self.external_threepeaters:
+            self.add_threepeater_support_from(col)
 
     def fix_jg(self) -> None:
         for w in self.wallnuts:
@@ -748,6 +828,7 @@ class Row:
                 self.add_hs(j)
             elif plant == JG_3:
                 self.add_jg(j)
+        self.add_external_threepeaters()
         self.fix_jg()
 
     # ---------------------------------------------------------------------
@@ -821,7 +902,12 @@ class Row:
         if target == 4:
             return 0.0
 
-        pre = Row(self.raw_row, MODE_FOOTBALL, use_modified_pole=self.use_modified_pole)
+        pre = Row(
+            self.raw_row,
+            MODE_FOOTBALL,
+            use_modified_pole=self.use_modified_pole,
+            external_threepeaters=self.external_threepeaters,
+        )
         pre.convert()
         pre.add_plants()
 
@@ -835,7 +921,7 @@ class Row:
 
         # Half of the segment immediately before the target plant.
         half_segment = target + 1
-        damage += 0.5 * pre.calc_walk_segment_damage(half_segment, hbfix, bite_lmt=5)
+        damage += 0.2 * pre.calc_walk_segment_damage(half_segment, hbfix, bite_lmt=5)
 
         return damage
 
@@ -1044,16 +1130,39 @@ class IZEBloodCalculator:
         self.use_modified_pole = use_modified_pole
         self.check_all_starfruit = check_all_starfruit
 
-    def calculate_lane(self, lane: Sequence[Union[str, int, None]], *, explain: bool = False) -> Dict[str, Any]:
+    def calculate_lane(
+        self,
+        lane: Sequence[Union[str, int, None]],
+        *,
+        adjacent_lanes: Optional[Sequence[Sequence[Union[str, int, None]]]] = None,
+        explain: bool = False,
+    ) -> Dict[str, Any]:
         row = normalize_lane(lane)
+
+        external_threepeaters: List[int] = []
+        if adjacent_lanes:
+            for adj_lane in adjacent_lanes:
+                adj = normalize_lane(adj_lane)
+                for col, plant in enumerate(adj):
+                    if plant == SFSS_18:
+                        external_threepeaters.append(col)
+
         values: Dict[str, Union[int, str]] = {}
         status: Dict[str, int] = {key: STATUS_NORMAL for key in MODE_KEYS}
         details: Dict[str, Any] = {}
 
+        if explain:
+            details["external_threepeater_cols"] = list(external_threepeaters)
+
         has_highlight = False
 
         # Pole-vaulting
-        r0 = Row(row, MODE_POLE, use_modified_pole=self.use_modified_pole)
+        r0 = Row(
+            row,
+            MODE_POLE,
+            use_modified_pole=self.use_modified_pole,
+            external_threepeaters=external_threepeaters,
+        )
         has_magnet = r0.has_magnet()
         pole_value = r0.compute()
         values["pole"] = pole_value
@@ -1066,7 +1175,12 @@ class IZEBloodCalculator:
             details["pole"] = dict(r0.pole_detail)
 
         # Slow
-        r1 = Row(row, MODE_SLOW, use_modified_pole=self.use_modified_pole)
+        r1 = Row(
+            row,
+            MODE_SLOW,
+            use_modified_pole=self.use_modified_pole,
+            external_threepeaters=external_threepeaters,
+        )
         slow_value = r1.compute()
         values["slow"] = slow_value
         if not has_highlight:
@@ -1080,7 +1194,12 @@ class IZEBloodCalculator:
             status["slow"] = STATUS_NOT_RECOMMENDED
 
         # Ladder
-        r2 = Row(row, MODE_LADDER, use_modified_pole=self.use_modified_pole)
+        r2 = Row(
+            row,
+            MODE_LADDER,
+            use_modified_pole=self.use_modified_pole,
+            external_threepeaters=external_threepeaters,
+        )
         ladder_pair = r2.compute_ladder()
         values["ladder"] = f"{ladder_pair.x}+{ladder_pair.y}"
         if not has_highlight:
@@ -1091,7 +1210,12 @@ class IZEBloodCalculator:
             status["ladder"] = STATUS_NOT_RECOMMENDED
 
         # Football
-        r3 = Row(row, MODE_FOOTBALL, use_modified_pole=self.use_modified_pole)
+        r3 = Row(
+            row,
+            MODE_FOOTBALL,
+            use_modified_pole=self.use_modified_pole,
+            external_threepeaters=external_threepeaters,
+        )
         football_value = r3.compute()
         values["football"] = football_value
         if not has_highlight:
@@ -1102,7 +1226,12 @@ class IZEBloodCalculator:
             status["football"] = STATUS_NOT_RECOMMENDED
 
         # Pole + ladder
-        r4 = Row(row, MODE_POLE_LADDER, use_modified_pole=self.use_modified_pole)
+        r4 = Row(
+            row,
+            MODE_POLE_LADDER,
+            use_modified_pole=self.use_modified_pole,
+            external_threepeaters=external_threepeaters,
+        )
         pole_ladder_pair = r4.compute_ladder()
         if pole_ladder_pair.empty:
             values["pole_ladder"] = ""
@@ -1122,12 +1251,28 @@ class IZEBloodCalculator:
             "status": status,
             "has_magnet": has_magnet,
         }
+        if external_threepeaters:
+            result["external_threepeater_cols"] = list(external_threepeaters)
         if explain:
             result["details"] = details
         return result
 
     def calculate_board(self, board: Sequence[Sequence[Union[str, int, None]]], *, explain: bool = False) -> List[Dict[str, Any]]:
-        return [self.calculate_lane(row[:5], explain=explain) for row in list(board)[:5]]
+        rows = [list(row)[:5] for row in list(board)[:5]]
+        results: List[Dict[str, Any]] = []
+
+        for row_idx, row in enumerate(rows):
+            adjacent_lanes: List[Sequence[Union[str, int, None]]] = []
+            if row_idx - 1 >= 0:
+                adjacent_lanes.append(rows[row_idx - 1])
+            if row_idx + 1 < len(rows):
+                adjacent_lanes.append(rows[row_idx + 1])
+
+            results.append(
+                self.calculate_lane(row, adjacent_lanes=adjacent_lanes, explain=explain)
+            )
+
+        return results
 
     def dumps(self, obj: Any) -> str:
         return json.dumps(obj, ensure_ascii=False, indent=2)
