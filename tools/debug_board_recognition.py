@@ -16,6 +16,8 @@ from core.board_recognizer import BoardRecognizer
 from core.board_debug import draw_board_results
 from core.theme_recognizer import ThemeRecognizer, StableThemeRecognizer
 from core.board_corrector import ThemeBoardCorrector
+from core.breaker_types import BreakContext
+from core.breaker_router import ThemeBreakerRouter
 
 try:
     from core.ize_blood_calculator import IZEBloodCalculator
@@ -899,6 +901,37 @@ def extract_ize_board(board, rows=5, cols=5):
     return ize_board
 
 
+def extract_strategy_board(board, rows=5, cols=9):
+    """
+    从当前修正后的 board 中取完整 5x9 label 棋盘。
+
+    这个结果传给 BreakContext.board_5x9。
+    破阵逻辑目前主要使用 board_5x5，但保留 5x9 可以方便后续判断右侧状态。
+    """
+    label_board = []
+
+    for r in range(rows):
+        lane = []
+
+        for c in range(cols):
+            label = "empty"
+
+            try:
+                cell = board[r][c]
+                if isinstance(cell, dict):
+                    label = get_cell_label(cell) or "empty"
+                else:
+                    label = normalize_blood_label(cell)
+            except Exception:
+                label = "empty"
+
+            lane.append(label)
+
+        label_board.append(lane)
+
+    return label_board
+
+
 def calculate_blood_table(blood_calculator, ize_board):
     if blood_calculator is None:
         return None
@@ -1259,6 +1292,57 @@ def draw_blood_table_window(
     return canvas
 
 
+def format_break_plan_log(break_plan):
+    """
+    Format BreakPlan for terminal logging.
+
+    目前只打印计划，不执行鼠标点击。
+    等 8 个主题策略稳定后，再把 BreakAction 接到 controller。
+    """
+    if break_plan is None:
+        return ""
+
+    action_texts = []
+
+    for action in getattr(break_plan, "actions", []) or []:
+        try:
+            row_text = str(int(action.row) + 1)
+        except Exception:
+            row_text = str(getattr(action, "row", "?"))
+
+        col = getattr(action, "col", None)
+        if col is None:
+            col_text = "None"
+        else:
+            try:
+                col_text = str(int(col) + 1)
+            except Exception:
+                col_text = str(col)
+
+        zombie = getattr(action, "zombie", "?")
+        count = getattr(action, "count", 1)
+        note = getattr(action, "note", "")
+
+        item = f"{zombie}@R{row_text}"
+        if col_text != "None":
+            item += f"C{col_text}"
+        if count != 1:
+            item += f"x{count}"
+        if note:
+            item += f"({note})"
+
+        action_texts.append(item)
+
+    actions_text = ", ".join(action_texts) if action_texts else "none"
+
+    return (
+        f"[Breaker] theme={getattr(break_plan, 'theme', None)} | "
+        f"confidence={getattr(break_plan, 'confidence', 0.0):.2f} | "
+        f"actions={actions_text} | "
+        f"reason={getattr(break_plan, 'reason', '')}"
+    )
+
+
 def main():
     config = load_config()
 
@@ -1271,12 +1355,25 @@ def main():
     print("Loading board corrector...")
     board_corrector = ThemeBoardCorrector(config)
 
+    strategy_cfg = config.get("strategy", {})
+    strategy_enabled = strategy_cfg.get("enabled", True)
+    strategy_log_plan = strategy_cfg.get("log_plan", True)
+    strategy_require_locked_theme = strategy_cfg.get("require_locked_theme", True)
+
+    strategy_router = None
+
+    if strategy_enabled:
+        print("Loading theme breaker router...")
+        strategy_router = ThemeBreakerRouter(config)
+
     blood_cfg = config.get("blood_calculator", {})
     blood_debug_enabled = blood_cfg.get("debug_window_enabled", True)
+    blood_needed = blood_debug_enabled or strategy_enabled
+
     blood_calculator = None
     blood_import_error_text = None
 
-    if blood_debug_enabled:
+    if blood_needed:
         if IZEBloodCalculator is None:
             blood_import_error_text = (
                 "Failed to import core.ize_blood_calculator. "
@@ -1307,6 +1404,9 @@ def main():
     last_theme_log_time = 0
 
     last_corrector_log_text = None
+
+    last_breaker_log_text = None
+    last_breaker_log_time = 0
 
     last_board_signature = None
     last_theme_reset_time = 0
@@ -1413,6 +1513,7 @@ def main():
                     locked_theme = None
                     last_theme_result = None
                     last_theme_log_text = None
+                    last_breaker_log_text = None
                     last_theme_reset_time = now
 
             last_board_signature = board_signature
@@ -1544,23 +1645,69 @@ def main():
                     last_corrector_log_text = corrector_log_text
 
 
-        if blood_debug_enabled:
-            blood_error_text = blood_import_error_text
-            blood_table = None
-            ize_board = None
+        blood_error_text = blood_import_error_text
+        blood_table = None
+        ize_board = None
 
-            if blood_calculator is not None:
+        if blood_calculator is not None:
+            try:
+                ize_board = extract_ize_board(board, rows=5, cols=5)
+                blood_table = calculate_blood_table(
+                    blood_calculator,
+                    ize_board,
+                )
+            except Exception as e:
+                blood_error_text = (
+                    f"{type(e).__name__}: {e}"
+                )
+
+        if strategy_router is not None:
+            strategy_theme = locked_theme
+
+            if (
+                strategy_theme is None
+                and not strategy_require_locked_theme
+                and isinstance(theme_result, dict)
+            ):
+                strategy_theme = theme_result.get("stable_theme") or theme_result.get("theme")
+
+            if (
+                strategy_theme is not None
+                and blood_table is not None
+                and ize_board is not None
+            ):
                 try:
-                    ize_board = extract_ize_board(board, rows=5, cols=5)
-                    blood_table = calculate_blood_table(
-                        blood_calculator,
-                        ize_board,
-                    )
-                except Exception as e:
-                    blood_error_text = (
-                        f"{type(e).__name__}: {e}"
+                    context = BreakContext(
+                        theme=strategy_theme,
+                        board_5x5=ize_board,
+                        board_5x9=extract_strategy_board(board, rows=5, cols=9),
+                        blood_table=blood_table,
+                        theme_result=theme_result,
+                        correction_info=correction_info,
+                        config=config,
                     )
 
+                    break_plan = strategy_router.solve(context)
+
+                    if strategy_log_plan:
+                        breaker_log_text = format_break_plan_log(break_plan)
+
+                        if breaker_log_text != last_breaker_log_text:
+                            print(breaker_log_text)
+                            last_breaker_log_text = breaker_log_text
+                            last_breaker_log_time = now
+
+
+                except Exception as e:
+                    breaker_log_text = f"[Breaker] {type(e).__name__}: {e}"
+
+                    if breaker_log_text != last_breaker_log_text:
+                        print(breaker_log_text)
+                        last_breaker_log_text = breaker_log_text
+                        last_breaker_log_time = now
+
+
+        if blood_debug_enabled:
             blood_vis = draw_blood_table_window(
                 blood_table,
                 ize_board=ize_board,
@@ -1596,6 +1743,7 @@ def main():
             last_theme_log_text = None
             last_board_signature = None
             last_corrector_log_text = None
+            last_breaker_log_text = None
             last_theme_reset_time = time.time()
             print("[Theme] Reset locked theme.")
 

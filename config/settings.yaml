@@ -143,7 +143,11 @@ frame_guard:
 
 
 strategy:
-  debug: true
+  enabled: true
+  log_plan: true
+  require_locked_theme: true
+  execute_actions: false
+
 
 plant_classifier:
   model_path: models/plant_cell_classifier.npz
