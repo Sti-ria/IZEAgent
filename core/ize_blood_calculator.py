@@ -33,7 +33,18 @@ as peashooter.  Adjacent-lane threepeater support is added on top of the
 original segmented model: calculate_board() detects threepeaters in the lanes
 immediately above and below the target lane, while calculate_lane() can accept
 adjacent_lanes explicitly.  Cross-lane threepeater damage includes both walking
-damage with corrected 6th-cell spawn geometry and bite-stage damage for all chewable plants on the firing path.
+damage with corrected 6th-cell spawn geometry and bite-stage damage for all
+chewable plants on the firing path.
+
+Tilted / starfruit-heavy theme support:
+    Rottenham/ize-calculator has a special single-mode branch for the tilted
+    starfruit theme.  When check_all_starfruit=True, calculate_board() follows
+    that branch: each row only reports slow-mode damage and independent slow
+    damage.  The slow-mode value is:
+        independent slow damage of this row + external damage from starfruit in
+        other rows.
+    Normal pole / ladder / football / pole-ladder modes are intentionally left
+    unused in this special branch, matching the original calculator UI.
 """
 
 from __future__ import annotations
@@ -1130,6 +1141,194 @@ class IZEBloodCalculator:
         self.use_modified_pole = use_modified_pole
         self.check_all_starfruit = check_all_starfruit
 
+    # ------------------------------------------------------------------
+    # Tilted / all-starfruit board-level helpers
+    # ------------------------------------------------------------------
+
+    def _starfruit_extra_empty(self, lane: Sequence[int], col: int) -> bool:
+        """
+        Original ize-calculator updateExtra() uses isEmpty() for the target
+        row.  In this port, is_empty() treats real empty, spikeweed, potato mine
+        and squash as empty, which matches the original helper.
+        """
+        if col < 0 or col >= len(lane):
+            return True
+        return is_empty(lane[col])
+
+    def update_starfruit_extra(
+        self,
+        extras: MutableMapping[int, int],
+        rows: Sequence[Sequence[int]],
+        source_row: int,
+        source_col: int,
+    ) -> None:
+        """
+        Port of Rottenham/ize-calculator Puzzle::updateExtra().
+
+        For one starfruit at rows[source_row][source_col], add its cross-row
+        damage to every other target row.  This is only used by the special
+        tilted / all-starfruit branch enabled with check_all_starfruit=True.
+        """
+        for target_row in range(len(rows)):
+            if target_row == source_row:
+                continue
+
+            diff = abs(target_row - source_row)
+            target_lane = rows[target_row]
+            col = source_col
+
+            if (col == 0 or col == 1) and diff == 1:
+                value = 13
+                if self._starfruit_extra_empty(target_lane, col + 1):
+                    value -= 2
+                if self._starfruit_extra_empty(target_lane, col + 2):
+                    value -= 2
+            elif (col == 0 and diff == 2) or (col == 2 and diff == 1):
+                value = 11
+                if self._starfruit_extra_empty(target_lane, 3):
+                    value -= 2
+                if self._starfruit_extra_empty(target_lane, 4):
+                    value -= 2
+            elif (col == 1 and diff == 2) or (col == 3 and diff == 1):
+                value = 5
+                if self._starfruit_extra_empty(target_lane, 4):
+                    value -= 2
+            else:
+                value = 2
+
+            # Original updateExtra() gives one extra point to the row above the
+            # source starfruit.
+            if target_row == source_row - 1:
+                value += 1
+
+            extras[target_row] = int(extras.get(target_row, 0)) + int(value)
+
+    def compute_external_starfruit_extras(self, rows: Sequence[Sequence[int]]) -> List[int]:
+        """
+        Return external starfruit damage for every row.
+
+        extras[i] is damage received by row i from starfruit in all other rows.
+        Same-row starfruit damage is already included in Row(..., MODE_SLOW).
+        """
+        extras_map: Dict[int, int] = {i: 0 for i in range(len(rows))}
+
+        for source_row, lane in enumerate(rows):
+            for source_col, plant in enumerate(lane[:5]):
+                if plant == YT_29:
+                    self.update_starfruit_extra(
+                        extras_map,
+                        rows,
+                        source_row,
+                        source_col,
+                    )
+
+        return [int(extras_map.get(i, 0)) for i in range(len(rows))]
+
+    def _tilted_slow_status(
+        self,
+        *,
+        adjusted_slow: int,
+        independent_slow: int,
+        row: Sequence[int],
+        has_magnet: bool,
+    ) -> Tuple[int, int]:
+        """
+        Highlight rules for the original tilted starfruit branch.
+
+        Slow column:
+            recommended if adjusted <= 63 - 6 * star_num and no magnet;
+            not recommended if adjusted >= 65;
+            otherwise normal.
+        Independent-blood column:
+            recommended if independent <= 25 and no magnet;
+            otherwise not recommended.  This matches the old UI behavior where
+            low independent values are highlighted and larger values appear as
+            grey parenthesized values.
+        """
+        star_num = sum(1 for plant in list(row)[:4] if plant == YT_29)
+
+        slow_status = STATUS_NORMAL
+        if adjusted_slow <= 63 - 6 * star_num and not has_magnet:
+            slow_status = STATUS_RECOMMENDED
+        elif adjusted_slow >= 65:
+            slow_status = STATUS_NOT_RECOMMENDED
+
+        independent_status = STATUS_RECOMMENDED if independent_slow <= 25 and not has_magnet else STATUS_NOT_RECOMMENDED
+
+        return slow_status, independent_status
+
+    def calculate_tilted_starfruit_board(
+        self,
+        rows: Sequence[Sequence[int]],
+        *,
+        explain: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """
+        Special single-mode board calculation for tilted / starfruit-heavy theme.
+
+        This intentionally does not calculate pole, ladder, football or
+        pole-ladder.  It mirrors the original calculator's tilted starfruit UI:
+        two columns are reported for every row:
+            - slow: independent slow damage + external starfruit damage;
+            - independent_blood: this row's slow damage without external
+              starfruit from other rows.
+        """
+        extras = self.compute_external_starfruit_extras(rows)
+        results: List[Dict[str, Any]] = []
+
+        for row_idx, row in enumerate(rows):
+            slow_row = Row(
+                row,
+                MODE_SLOW,
+                use_modified_pole=self.use_modified_pole,
+                external_threepeaters=[],
+            )
+            has_magnet = slow_row.has_magnet()
+            independent_slow = slow_row.compute()
+            extra = int(extras[row_idx])
+            adjusted_slow = int(independent_slow + extra)
+
+            slow_status, independent_status = self._tilted_slow_status(
+                adjusted_slow=adjusted_slow,
+                independent_slow=independent_slow,
+                row=row,
+                has_magnet=has_magnet,
+            )
+
+            values: Dict[str, Union[int, str]] = {
+                "slow": adjusted_slow,
+                "independent_blood": independent_slow,
+            }
+            status: Dict[str, int] = {
+                "slow": slow_status,
+                "independent_blood": independent_status,
+            }
+
+            result: Dict[str, Any] = {
+                "lane": [label_of(x) for x in row],
+                "values": values,
+                "status": status,
+                "has_magnet": has_magnet,
+                "tilted_starfruit_mode": True,
+                "external_starfruit_extra": extra,
+                "slow_without_external_starfruit": independent_slow,
+            }
+
+            if explain:
+                result["details"] = {
+                    "tilted_starfruit": {
+                        "external_starfruit_extra": extra,
+                        "independent_slow": independent_slow,
+                        "adjusted_slow": adjusted_slow,
+                        "starfruit_count_first_4_cols": sum(1 for plant in list(row)[:4] if plant == YT_29),
+                        "has_magnet": has_magnet,
+                    }
+                }
+
+            results.append(result)
+
+        return results
+
     def calculate_lane(
         self,
         lane: Sequence[Union[str, int, None]],
@@ -1257,8 +1456,21 @@ class IZEBloodCalculator:
             result["details"] = details
         return result
 
-    def calculate_board(self, board: Sequence[Sequence[Union[str, int, None]]], *, explain: bool = False) -> List[Dict[str, Any]]:
-        rows = [list(row)[:5] for row in list(board)[:5]]
+    def calculate_board(
+        self,
+        board: Sequence[Sequence[Union[str, int, None]]],
+        *,
+        explain: bool = False,
+        check_all_starfruit: Optional[bool] = None,
+    ) -> List[Dict[str, Any]]:
+        rows = [normalize_lane(row) for row in list(board)[:5]]
+
+        if check_all_starfruit is None:
+            check_all_starfruit = self.check_all_starfruit
+
+        if check_all_starfruit:
+            return self.calculate_tilted_starfruit_board(rows, explain=explain)
+
         results: List[Dict[str, Any]] = []
 
         for row_idx, row in enumerate(rows):
@@ -1301,7 +1513,47 @@ def format_lane_result(result: Mapping[str, Any], *, row_name: str = "单行", n
     return " ".join(str(cells[i]).ljust(widths[i]) for i in range(len(cells)))
 
 
+def format_tilted_starfruit_result(
+    result: Mapping[str, Any],
+    *,
+    row_name: str = "单行",
+    no_status: bool = False,
+) -> str:
+    values = result["values"]
+    status = result["status"]
+    cells = [
+        row_name,
+        decorate_value(values.get("slow", ""), status.get("slow", 0), no_status=no_status),
+        decorate_value(
+            values.get("independent_blood", ""),
+            status.get("independent_blood", 0),
+            no_status=no_status,
+        ),
+    ]
+    widths = [8, 10, 12]
+    return " ".join(str(cells[i]).ljust(widths[i]) for i in range(len(cells)))
+
+
 def format_result_table(results: Sequence[Mapping[str, Any]], *, no_status: bool = False) -> str:
+    tilted_mode = bool(results) and all(result.get("tilted_starfruit_mode") for result in results)
+
+    if tilted_mode:
+        headers = ["行", "慢速", "独立算血"]
+        widths = [8, 10, 12]
+        lines = [
+            " ".join(headers[i].ljust(widths[i]) for i in range(len(headers))),
+            " ".join(("-" * min(widths[i], 8)).ljust(widths[i]) for i in range(len(headers))),
+        ]
+        for i, result in enumerate(results):
+            lines.append(
+                format_tilted_starfruit_result(
+                    result,
+                    row_name=f"第{i + 1}行",
+                    no_status=no_status,
+                )
+            )
+        return "\n".join(lines)
+
     headers = ["行", "撑杆", "慢速", "梯子", "橄榄", "撑杆梯子"]
     widths = [8, 10, 10, 12, 10, 12]
     lines = [
@@ -1347,6 +1599,7 @@ __all__ = [
     "normalize_lane",
     "format_result_table",
     "format_lane_result",
+    "format_tilted_starfruit_result",
     "explain_pole",
     "MODE_KEYS",
     "MODE_LABELS_ZH",

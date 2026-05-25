@@ -688,12 +688,18 @@ BLOOD_MODE_KEYS = [
     "pole_ladder",
 ]
 
+TILTED_STARFRUIT_BLOOD_MODE_KEYS = [
+    "slow",
+    "independent_blood",
+]
+
 BLOOD_MODE_NAMES_CN = {
     "pole": "撑杆",
     "slow": "慢速",
     "ladder": "梯子",
     "football": "橄榄",
     "pole_ladder": "撑杆梯子",
+    "independent_blood": "独立算血",
 }
 
 BLOOD_MODE_NAMES_EN = {
@@ -702,6 +708,7 @@ BLOOD_MODE_NAMES_EN = {
     "ladder": "Ladder",
     "football": "Football",
     "pole_ladder": "Pole+Ladder",
+    "independent_blood": "Independent",
 }
 
 BLOOD_ROW_NAMES_CN = ["第一行", "第二行", "第三行", "第四行", "第五行"]
@@ -932,15 +939,52 @@ def extract_strategy_board(board, rows=5, cols=9):
     return label_board
 
 
-def calculate_blood_table(blood_calculator, ize_board):
+def calculate_blood_table(
+    blood_calculator,
+    ize_board,
+    *,
+    check_all_starfruit=False,
+):
     if blood_calculator is None:
         return None
 
     try:
-        return blood_calculator.calculate_board(ize_board, explain=False)
+        return blood_calculator.calculate_board(
+            ize_board,
+            explain=False,
+            check_all_starfruit=check_all_starfruit,
+        )
     except TypeError:
         # 兼容旧版 calculate_board(board) 接口。
+        # 旧版没有 check_all_starfruit 参数时，退回普通算血。
         return blood_calculator.calculate_board(ize_board)
+
+
+def is_tilted_starfruit_blood_result(blood_table):
+    """
+    判断当前 blood_table 是否是倾斜阵杨桃专用模式。
+
+    新版 core/ize_blood_calculator.py 在 check_all_starfruit=True 时，
+    每行会带 tilted_starfruit_mode=True，且 values 中通常只有：
+        slow
+        independent_blood
+    """
+    if not isinstance(blood_table, (list, tuple)) or not blood_table:
+        return False
+
+    first = blood_table[0]
+
+    if not isinstance(first, dict):
+        return False
+
+    if first.get("tilted_starfruit_mode"):
+        return True
+
+    values = first.get("values", {})
+    if isinstance(values, dict) and "independent_blood" in values:
+        return True
+
+    return False
 
 
 def get_blood_row_result(blood_table, row_idx):
@@ -1014,6 +1058,14 @@ def get_blood_mode_value(row_result, mode_key):
             "pvl",
             "撑杆梯子",
         ],
+        "independent_blood": [
+            "independent_blood",
+            "independent",
+            "raw_slow",
+            "slow_raw",
+            "slow_without_external_starfruit",
+            "独立算血",
+        ],
     }
 
     for key in aliases.get(mode_key, [mode_key]):
@@ -1079,6 +1131,14 @@ def get_blood_mode_status(row_result, mode_key):
         "ladder": ["ladder", "ladder_zombie", "梯子"],
         "football": ["football", "football_zombie", "橄榄"],
         "pole_ladder": ["pole_ladder", "pole+ladder", "pvl", "撑杆梯子"],
+        "independent_blood": [
+            "independent_blood",
+            "independent",
+            "raw_slow",
+            "slow_raw",
+            "slow_without_external_starfruit",
+            "独立算血",
+        ],
     }
 
     for key in aliases.get(mode_key, [mode_key]):
@@ -1174,15 +1234,37 @@ def draw_blood_table_window(
     row_gap = 72
 
     row_label_x = 22
-    col_centers = {
-        "pole": 142,
-        "slow": 245,
-        "ladder": 350,
-        "football": 455,
-        "pole_ladder": 555,
-    }
 
-    for mode_key in BLOOD_MODE_KEYS:
+    tilted_starfruit_mode = is_tilted_starfruit_blood_result(blood_table)
+
+    if tilted_starfruit_mode:
+        mode_keys = TILTED_STARFRUIT_BLOOD_MODE_KEYS
+        col_centers = {
+            "slow": 220,
+            "independent_blood": 360,
+        }
+
+        draw_ui_text(
+            canvas,
+            "倾斜阵杨桃邻路模式",
+            BLOOD_WINDOW_WIDTH // 2,
+            108,
+            font_size=17,
+            color=(90, 90, 90),
+            fallback_text="Tilted starfruit mode",
+            anchor="center",
+        )
+    else:
+        mode_keys = BLOOD_MODE_KEYS
+        col_centers = {
+            "pole": 142,
+            "slow": 245,
+            "ladder": 350,
+            "football": 455,
+            "pole_ladder": 555,
+        }
+
+    for mode_key in mode_keys:
         draw_ui_text(
             canvas,
             BLOOD_MODE_NAMES_CN[mode_key],
@@ -1212,7 +1294,7 @@ def draw_blood_table_window(
 
         row_result = get_blood_row_result(blood_table, row_idx)
 
-        for mode_key in BLOOD_MODE_KEYS:
+        for mode_key in mode_keys:
             raw_value = get_blood_mode_value(row_result, mode_key)
             value_text = format_blood_value(raw_value)
             status = get_blood_mode_status(row_result, mode_key)
@@ -1370,6 +1452,25 @@ def main():
     blood_debug_enabled = blood_cfg.get("debug_window_enabled", True)
     blood_needed = blood_debug_enabled or strategy_enabled
 
+    # 倾斜阵使用原 IZE 计算器的杨桃邻路算血模式：
+    #   慢速 = 本行独立慢速算血 + 其他路杨桃额外伤害
+    #   独立算血 = 本行原始慢速算血
+    #
+    # 默认只在“倾斜”主题启用。
+    # 如果后续还想给其他主题启用，可以在 settings.yaml 中增加：
+    #
+    # blood_calculator:
+    #   tilted_starfruit_themes:
+    #     - 倾斜
+    tilted_starfruit_themes = blood_cfg.get(
+        "tilted_starfruit_themes",
+        blood_cfg.get("starfruit_extra_themes", ["倾斜"]),
+    )
+    tilted_starfruit_themes = {
+        str(theme)
+        for theme in tilted_starfruit_themes
+    }
+
     blood_calculator = None
     blood_import_error_text = None
 
@@ -1407,6 +1508,8 @@ def main():
 
     last_breaker_log_text = None
     last_breaker_log_time = 0
+
+    last_blood_mode_log_text = None
 
     last_board_signature = None
     last_theme_reset_time = 0
@@ -1514,6 +1617,7 @@ def main():
                     last_theme_result = None
                     last_theme_log_text = None
                     last_breaker_log_text = None
+                    last_blood_mode_log_text = None
                     last_theme_reset_time = now
 
             last_board_signature = board_signature
@@ -1652,9 +1756,27 @@ def main():
         if blood_calculator is not None:
             try:
                 ize_board = extract_ize_board(board, rows=5, cols=5)
+
+                check_all_starfruit = (
+                    locked_theme is not None
+                    and str(locked_theme) in tilted_starfruit_themes
+                )
+
+                blood_mode_log_text = (
+                    "[BloodCalculator] tilted starfruit mode enabled "
+                    f"for theme={locked_theme}"
+                    if check_all_starfruit
+                    else "[BloodCalculator] normal mode"
+                )
+
+                if blood_mode_log_text != last_blood_mode_log_text:
+                    print(blood_mode_log_text)
+                    last_blood_mode_log_text = blood_mode_log_text
+
                 blood_table = calculate_blood_table(
                     blood_calculator,
                     ize_board,
+                    check_all_starfruit=check_all_starfruit,
                 )
             except Exception as e:
                 blood_error_text = (
@@ -1744,6 +1866,7 @@ def main():
             last_board_signature = None
             last_corrector_log_text = None
             last_breaker_log_text = None
+            last_blood_mode_log_text = None
             last_theme_reset_time = time.time()
             print("[Theme] Reset locked theme.")
 
