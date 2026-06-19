@@ -36,8 +36,8 @@ def check_can_single_dance(plants: list[str]) -> bool:
     """
     total_output = sum(1 for p in plants if p in ATTACK_PLANTS)
     
-    back_3 = plants[2:5]  # 第3, 4, 5列
-    back_2 = plants[3:5]  # 第4, 5列
+    back_3 = plants[:3]
+    back_2 = plants[:2]
     
     back_3_outputs = sum(1 for p in back_3 if p in ATTACK_PLANTS)
     back_2_outputs = sum(1 for p in back_2 if p in ATTACK_PLANTS)
