@@ -200,4 +200,13 @@ board_corrector:
       peashooter: repeater
 
 
-# 撑杆16，路障29，铁通65，橄榄80，扶梯25+25
+# 撑杆17，路障28，铁通65，橄榄80，扶梯25+15
+
+
+debug_ui:
+  board_fps: 12
+  blood_fps: 5
+
+debug_performance:
+  enabled: false
+  log_interval: 1.0

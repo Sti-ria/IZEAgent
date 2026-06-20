@@ -28,14 +28,10 @@ else:
     IZEBloodCalculator_IMPORT_ERROR = None
 
 
-
-
 CONFIG_PATH = ROOT_DIR / "config" / "settings.yaml"
 LOCAL_CONFIG_PATH = ROOT_DIR / "config" / "local_settings.yaml"
 
-
 user32 = ctypes.windll.user32
-
 
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(2)
@@ -81,13 +77,11 @@ def load_config():
 
 def get_window_title(hwnd):
     length = user32.GetWindowTextLengthW(hwnd)
-
     if length <= 0:
         return ""
 
     buffer = ctypes.create_unicode_buffer(length + 1)
     user32.GetWindowTextW(hwnd, buffer, length + 1)
-
     return buffer.value.strip()
 
 
@@ -138,12 +132,10 @@ def enum_visible_windows():
             return True
 
         title = get_window_title(hwnd)
-
         if not title:
             return True
 
         rect = get_window_rect_on_screen(hwnd)
-
         if rect is None:
             return True
 
@@ -157,11 +149,9 @@ def enum_visible_windows():
                 "region": rect,
             }
         )
-
         return True
 
     user32.EnumWindows(EnumWindowsProc(callback), 0)
-
     return windows
 
 
@@ -176,13 +166,13 @@ def find_pvz_window(config):
         ]
 
     windows = enum_visible_windows()
-
     candidates = []
 
     bad_words = [
         "visual studio code",
         "vscode",
         "pvzagent",
+        "izeagent",
         "powershell",
         "cmd.exe",
         "terminal",
@@ -202,7 +192,6 @@ def find_pvz_window(config):
 
         for keyword in title_keywords:
             keyword_lower = str(keyword).lower()
-
             if keyword_lower in title_lower:
                 candidates.append(win)
                 break
@@ -213,14 +202,14 @@ def find_pvz_window(config):
             print(f"- {win['title']!r}, region={win['region']}")
 
         raise RuntimeError(
-            "没有找到 PVZ 窗口。请确认游戏已经打开，并且 settings.yaml 里的 window.title_keywords 正确。"
+            "没有找到 PVZ 窗口。请确认游戏已经打开，并且 settings.yaml 里的 "
+            "window.title_keywords 正确。"
         )
 
     candidates.sort(
         key=lambda w: w["region"]["width"] * w["region"]["height"],
         reverse=True,
     )
-
     return candidates[0]
 
 
@@ -271,7 +260,6 @@ def is_capture_region_occluded(target_hwnd, capture_region):
         return True, "PVZ window is minimized"
 
     windows = enum_visible_windows()
-
     capture_area = capture_region["width"] * capture_region["height"]
 
     if capture_area <= 0:
@@ -325,46 +313,132 @@ def is_capture_region_occluded(target_hwnd, capture_region):
     return False, "ok"
 
 
-def grab_region(region):
-    import time
-    import cv2
-    import mss
-    import numpy as np
-    import pyautogui
+class RegionGrabber:
+    """
+    截图器。
 
-    safe_region = {
-        "left": int(region["left"]),
-        "top": int(region["top"]),
-        "width": int(region["width"]),
-        "height": int(region["height"]),
-    }
+    性能优化：
+    - 原版 grab_region 每帧都会 with mss.mss() 新建对象；
+    - 这里改成复用一个 mss 实例，失败时再回退 pyautogui。
+    """
 
-    for _ in range(2):
+    def __init__(self):
+        self.sct = None
+        self.last_error_text = None
+        self.last_error_log_time = 0.0
+
+    def _log_error(self, text, min_interval=1.0):
+        now = time.time()
+        if text != self.last_error_text or now - self.last_error_log_time >= min_interval:
+            print(text)
+            self.last_error_text = text
+            self.last_error_log_time = now
+
+    def grab(self, region):
+        import mss
+        import pyautogui
+
+        safe_region = {
+            "left": int(region["left"]),
+            "top": int(region["top"]),
+            "width": int(region["width"]),
+            "height": int(region["height"]),
+        }
+
         try:
-            with mss.mss() as sct:
-                img = np.array(sct.grab(safe_region))
+            if self.sct is None:
+                self.sct = mss.mss()
 
+            img = np.array(self.sct.grab(safe_region))
             return cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-
         except Exception as e:
-            print(f"[Capture] mss grab failed: {type(e).__name__}: {e}")
-            time.sleep(0.05)
-
-    try:
-        img = pyautogui.screenshot(
-            region=(
-                safe_region["left"],
-                safe_region["top"],
-                safe_region["width"],
-                safe_region["height"],
+            self.sct = None
+            self._log_error(
+                f"[Capture] mss grab failed: {type(e).__name__}: {e}",
+                min_interval=1.0,
             )
-        )
 
-        return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+        try:
+            img = pyautogui.screenshot(
+                region=(
+                    safe_region["left"],
+                    safe_region["top"],
+                    safe_region["width"],
+                    safe_region["height"],
+                )
+            )
+            return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+        except Exception as e:
+            self._log_error(
+                f"[Capture] fallback screenshot failed: {type(e).__name__}: {e}",
+                min_interval=1.0,
+            )
+            return None
 
-    except Exception as e:
-        print(f"[Capture] fallback screenshot failed: {type(e).__name__}: {e}")
-        return None
+    def close(self):
+        try:
+            if self.sct is not None:
+                self.sct.close()
+        except Exception:
+            pass
+        self.sct = None
+
+
+def grab_region(region):
+    """
+    兼容旧调用方式。
+    新主循环会直接使用 RegionGrabber。
+    """
+    grabber = RegionGrabber()
+    try:
+        return grabber.grab(region)
+    finally:
+        grabber.close()
+
+
+class LoopProfiler:
+    """
+    简单性能计时器。
+
+    默认关闭，避免终端刷屏。
+    如果需要定位性能瓶颈，可以在 config/local_settings.yaml 中手动开启：
+
+    debug_performance:
+      enabled: true
+      log_interval: 1.0
+    """
+
+    def __init__(self, enabled=False, interval=1.0):
+        self.enabled = bool(enabled)
+        self.interval = float(interval)
+        self.last_log = time.perf_counter()
+        self.data = {}
+
+    def add(self, name, dt):
+        if not self.enabled:
+            return
+
+        total, count = self.data.get(name, (0.0, 0))
+        self.data[name] = (total + float(dt), count + 1)
+
+    def maybe_log(self):
+        if not self.enabled:
+            return
+
+        now = time.perf_counter()
+        if now - self.last_log < self.interval:
+            return
+
+        parts = []
+        for name, (total, count) in sorted(self.data.items()):
+            if count:
+                parts.append(f"{name}={total / count * 1000:.1f}ms")
+
+        if parts:
+            print("[Perf] " + " | ".join(parts))
+
+        self.data.clear()
+        self.last_log = now
 
 
 def read_key():
@@ -407,11 +481,9 @@ def make_theme_recognizer(config):
         "signatures_path",
         "config/theme_signatures.yaml",
     )
-
     signatures_path = resolve_project_path(signatures_path)
 
     theme_recognizer = ThemeRecognizer(str(signatures_path))
-
     stable_theme_recognizer = StableThemeRecognizer(
         theme_recognizer,
         required_frames=theme_cfg.get("required_frames", 4),
@@ -455,16 +527,13 @@ def theme_display_name(theme):
 
 def make_locked_theme_result(locked_theme, last_theme_result=None):
     result = dict(last_theme_result or {})
-
     result["theme"] = locked_theme
     result["stable"] = True
     result["stable_theme"] = locked_theme
-
     result.setdefault("score", 1.0)
     result.setdefault("margin", 0.0)
     result.setdefault("unknown_empty_count", 0)
     result.setdefault("candidates", [])
-
     return result
 
 
@@ -487,7 +556,6 @@ def draw_theme_overlay(vis, theme_result, locked_theme):
         (0, 0, 0),
         -1,
     )
-
     cv2.addWeighted(overlay, 0.45, vis, 0.55, 0, vis)
 
     theme = theme_result.get("theme")
@@ -507,7 +575,6 @@ def draw_theme_overlay(vis, theme_result, locked_theme):
     ]
 
     y = panel_y1 + 22
-
     for line in lines:
         cv2.putText(
             vis,
@@ -634,7 +701,6 @@ def make_board_signature(cell_results):
 
         if row is None:
             row = idx // 9
-
         if col is None:
             col = idx % 9
 
@@ -646,7 +712,6 @@ def make_board_signature(cell_results):
             col = idx % 9
 
         label = get_cell_label(cell)
-
         if label:
             plant_count += 1
 
@@ -662,18 +727,14 @@ def count_signature_changes(old_signature, new_signature):
 
     old_map = {(r, c): label for r, c, label in old_signature}
     new_map = {(r, c): label for r, c, label in new_signature}
-
     keys = set(old_map.keys()) | set(new_map.keys())
 
     changed = 0
-
     for key in keys:
         if old_map.get(key, "") != new_map.get(key, ""):
             changed += 1
 
     return changed
-
-
 
 
 BLOOD_DEBUG_WINDOW_NAME = "IZE Blood Calculator Debug"
@@ -721,6 +782,7 @@ _PIL_FONT_CACHE = {}
 def get_pil_font(size):
     """
     OpenCV 自带字体不能稳定显示中文。
+
     如果本机安装了 Pillow 且能找到 Windows 中文字体，就用 PIL 画中文；
     否则自动退回英文 OpenCV 文本。
     """
@@ -739,10 +801,10 @@ def get_pil_font(size):
         return None
 
     font_candidates = [
-        "C:/Windows/Fonts/msyh.ttc",       # Microsoft YaHei
+        "C:/Windows/Fonts/msyh.ttc",
         "C:/Windows/Fonts/msyh.ttf",
-        "C:/Windows/Fonts/simhei.ttf",     # SimHei
-        "C:/Windows/Fonts/simsun.ttc",     # SimSun
+        "C:/Windows/Fonts/simhei.ttf",
+        "C:/Windows/Fonts/simsun.ttc",
         "/System/Library/Fonts/PingFang.ttc",
         "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
@@ -776,6 +838,7 @@ def _text_size(text, font_size=22, thickness=1, fallback_text=None):
     if font is not None:
         try:
             from PIL import Image, ImageDraw
+
             dummy = Image.new("RGB", (10, 10), (255, 255, 255))
             draw = ImageDraw.Draw(dummy)
             bbox = draw.textbbox((0, 0), text, font=font)
@@ -806,6 +869,7 @@ def draw_ui_text(
 ):
     """
     在 BGR OpenCV 图像上画文本。
+
     - x/y 是文本左上角坐标；
     - anchor="center" 时，x 表示中心点；
     - color 是 BGR。
@@ -823,11 +887,13 @@ def draw_ui_text(
             rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             pil_img = Image.fromarray(rgb)
             draw = ImageDraw.Draw(pil_img)
+
             bbox = draw.textbbox((0, 0), text, font=font)
             width = bbox[2] - bbox[0]
 
             draw_x = int(x - width / 2) if anchor == "center" else int(x)
             draw_y = int(y)
+
             rgb_color = (int(color[2]), int(color[1]), int(color[0]))
 
             if bold:
@@ -838,11 +904,9 @@ def draw_ui_text(
 
             image[:, :] = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
             return image
-
         except Exception:
             pass
 
-    # Fallback: OpenCV 英文文本。
     draw_text = fallback_text
     scale = max(0.35, font_size / 32.0)
     (w, h), baseline = cv2.getTextSize(
@@ -851,6 +915,7 @@ def draw_ui_text(
         scale,
         thickness,
     )
+
     draw_x = int(x - w / 2) if anchor == "center" else int(x)
     draw_y = int(y + h)
 
@@ -864,6 +929,7 @@ def draw_ui_text(
         thickness,
         cv2.LINE_AA,
     )
+
     return image
 
 
@@ -894,6 +960,7 @@ def extract_ize_board(board, rows=5, cols=5):
 
             try:
                 cell = board[r][c]
+
                 if isinstance(cell, dict):
                     label = get_cell_label(cell) or "empty"
                 else:
@@ -911,9 +978,7 @@ def extract_ize_board(board, rows=5, cols=5):
 def extract_strategy_board(board, rows=5, cols=9):
     """
     从当前修正后的 board 中取完整 5x9 label 棋盘。
-
     这个结果传给 BreakContext.board_5x9。
-    破阵逻辑目前主要使用 board_5x5，但保留 5x9 可以方便后续判断右侧状态。
     """
     label_board = []
 
@@ -925,6 +990,7 @@ def extract_strategy_board(board, rows=5, cols=9):
 
             try:
                 cell = board[r][c]
+
                 if isinstance(cell, dict):
                     label = get_cell_label(cell) or "empty"
                 else:
@@ -937,6 +1003,20 @@ def extract_strategy_board(board, rows=5, cols=9):
         label_board.append(lane)
 
     return label_board
+
+
+def make_ize_signature(ize_board, locked_theme, check_all_starfruit):
+    """
+    算血 / 策略缓存签名。
+
+    只有主题、倾斜杨桃模式、前 5 列棋盘发生变化时，
+    才重新算血和跑策略。
+    """
+    return (
+        str(locked_theme),
+        bool(check_all_starfruit),
+        tuple(tuple(str(cell) for cell in row[:5]) for row in ize_board[:5]),
+    )
 
 
 def calculate_blood_table(
@@ -956,18 +1036,12 @@ def calculate_blood_table(
         )
     except TypeError:
         # 兼容旧版 calculate_board(board) 接口。
-        # 旧版没有 check_all_starfruit 参数时，退回普通算血。
         return blood_calculator.calculate_board(ize_board)
 
 
 def is_tilted_starfruit_blood_result(blood_table):
     """
     判断当前 blood_table 是否是倾斜阵杨桃专用模式。
-
-    新版 core/ize_blood_calculator.py 在 check_all_starfruit=True 时，
-    每行会带 tilted_starfruit_mode=True，且 values 中通常只有：
-        slow
-        independent_blood
     """
     if not isinstance(blood_table, (list, tuple)) or not blood_table:
         return False
@@ -1025,6 +1099,7 @@ def get_blood_values(row_result):
         values = row_result.get("values")
         if isinstance(values, dict):
             return values
+
         return row_result
 
     return {}
@@ -1156,11 +1231,6 @@ def draw_blood_table_window(
 ):
     """
     单独绘制一个算血器 debug 窗口。
-
-    设计目标：
-    - 终端不刷算血结果，避免信息太快；
-    - OpenCV 窗口每帧刷新，类似原 IZE 血量计算器 UI；
-    - 推荐项灰底加粗，不推荐项用括号和灰字。
     """
     canvas = np.full(
         (BLOOD_WINDOW_HEIGHT, BLOOD_WINDOW_WIDTH, 3),
@@ -1168,7 +1238,6 @@ def draw_blood_table_window(
         dtype=np.uint8,
     )
 
-    # 顶部标题栏样式。
     cv2.rectangle(canvas, (0, 0), (BLOOD_WINDOW_WIDTH, 56), (238, 238, 238), -1)
     cv2.line(canvas, (0, 56), (BLOOD_WINDOW_WIDTH, 56), (225, 225, 225), 1)
 
@@ -1191,8 +1260,8 @@ def draw_blood_table_window(
         theme_cn = str(locked_theme)
         theme_en = theme_display_name(locked_theme)
 
-    subtitle_cn = f"当前识别算血结果    主题：{theme_cn}"
-    subtitle_en = f"Current Blood Result    Theme: {theme_en}"
+    subtitle_cn = f"当前识别算血结果 主题：{theme_cn}"
+    subtitle_en = f"Current Blood Result Theme: {theme_en}"
 
     draw_ui_text(
         canvas,
@@ -1232,7 +1301,6 @@ def draw_blood_table_window(
     header_y = 132
     row_start_y = 188
     row_gap = 72
-
     row_label_x = 22
 
     tilted_starfruit_mode = is_tilted_starfruit_blood_result(blood_table)
@@ -1277,7 +1345,6 @@ def draw_blood_table_window(
             anchor="center",
         )
 
-    # 表格行。
     for row_idx in range(5):
         y = row_start_y + row_idx * row_gap
 
@@ -1321,6 +1388,7 @@ def draw_blood_table_window(
                 y1 = int(y - 13)
                 x2 = int(cx + cell_w / 2)
                 y2 = int(y1 + cell_h)
+
                 cv2.rectangle(canvas, (x1, y1), (x2, y2), (210, 210, 210), -1)
                 bold = True
             elif status < 0:
@@ -1339,7 +1407,6 @@ def draw_blood_table_window(
                 anchor="center",
             )
 
-    # 底部显示送入算血器的前 5 列，便于判断 CV 输入是否对。
     footer_y = BLOOD_WINDOW_HEIGHT - 58
     cv2.line(canvas, (0, footer_y - 14), (BLOOD_WINDOW_WIDTH, footer_y - 14), (225, 225, 225), 1)
 
@@ -1406,10 +1473,13 @@ def format_break_plan_log(break_plan):
         note = getattr(action, "note", "")
 
         item = f"{zombie}@R{row_text}"
+
         if col_text != "None":
             item += f"C{col_text}"
+
         if count != 1:
             item += f"x{count}"
+
         if note:
             item += f"({note})"
 
@@ -1443,7 +1513,6 @@ def main():
     strategy_require_locked_theme = strategy_cfg.get("require_locked_theme", True)
 
     strategy_router = None
-
     if strategy_enabled:
         print("Loading theme breaker router...")
         strategy_router = ThemeBreakerRouter(config)
@@ -1452,24 +1521,11 @@ def main():
     blood_debug_enabled = blood_cfg.get("debug_window_enabled", True)
     blood_needed = blood_debug_enabled or strategy_enabled
 
-    # 倾斜阵使用原 IZE 计算器的杨桃邻路算血模式：
-    #   慢速 = 本行独立慢速算血 + 其他路杨桃额外伤害
-    #   独立算血 = 本行原始慢速算血
-    #
-    # 默认只在“倾斜”主题启用。
-    # 如果后续还想给其他主题启用，可以在 settings.yaml 中增加：
-    #
-    # blood_calculator:
-    #   tilted_starfruit_themes:
-    #     - 倾斜
     tilted_starfruit_themes = blood_cfg.get(
         "tilted_starfruit_themes",
         blood_cfg.get("starfruit_extra_themes", ["倾斜"]),
     )
-    tilted_starfruit_themes = {
-        str(theme)
-        for theme in tilted_starfruit_themes
-    }
+    tilted_starfruit_themes = {str(theme) for theme in tilted_starfruit_themes}
 
     blood_calculator = None
     blood_import_error_text = None
@@ -1486,34 +1542,52 @@ def main():
             print("Loading IZE blood calculator...")
             blood_calculator = IZEBloodCalculator()
 
-
     theme_cfg = config.get("theme", {})
     theme_max_col = theme_cfg.get("max_col", 4)
-
     theme_log_until_locked = theme_cfg.get("log_until_locked", True)
     theme_log_after_locked = theme_cfg.get("log_after_locked", False)
     theme_check_after_locked = theme_cfg.get("check_after_locked", False)
-
     theme_reset_on_round_change = theme_cfg.get("reset_on_round_change", True)
     round_change_min_changed_cells = theme_cfg.get("round_change_min_changed_cells", 8)
     round_change_min_plants = theme_cfg.get("round_change_min_plants", 8)
     round_change_cooldown = theme_cfg.get("round_change_cooldown", 1.0)
 
+    # Debug UI 限频配置。没有配置时使用安全默认值。
+    debug_ui_cfg = config.get("debug_ui", {})
+    board_debug_fps = float(debug_ui_cfg.get("board_fps", 12))
+    blood_debug_fps = float(debug_ui_cfg.get("blood_fps", 5))
+
+    board_debug_interval = 1.0 / max(1.0, board_debug_fps)
+    blood_debug_interval = 1.0 / max(1.0, blood_debug_fps)
+
+    last_board_debug_draw_time = 0.0
+    last_blood_debug_draw_time = 0.0
+
+    perf_cfg = config.get("debug_performance", {})
+    profiler = LoopProfiler(
+        enabled=perf_cfg.get("enabled", False),
+        interval=perf_cfg.get("log_interval", 1.0),
+    )
+
+
     locked_theme = None
     last_theme_result = None
     last_theme_log_text = None
     last_theme_log_time = 0
-
     last_corrector_log_text = None
-
     last_breaker_log_text = None
     last_breaker_log_time = 0
-
     last_blood_mode_log_text = None
-
     last_board_signature = None
     last_theme_reset_time = 0
 
+    # 算血 / 策略缓存。
+    last_ize_signature = None
+    cached_ize_board = None
+    cached_strategy_board = None
+    cached_blood_table = None
+    cached_blood_error_text = blood_import_error_text
+    cached_break_plan = None
 
     win = find_pvz_window(config)
     hwnd = win["hwnd"]
@@ -1526,6 +1600,9 @@ def main():
     print("\nDebug board recognition started.")
     print("Press Q or ESC to quit.")
     print("Press R to reset locked theme.")
+    if profiler.enabled:
+        print("[Perf] enabled. You can disable it with debug_performance.enabled=false.")
+        print(f"[DebugUI] board_fps={board_debug_fps}, blood_fps={blood_debug_fps}")
 
     if blood_debug_enabled:
         cv2.namedWindow(BLOOD_DEBUG_WINDOW_NAME, cv2.WINDOW_NORMAL)
@@ -1534,6 +1611,7 @@ def main():
             BLOOD_WINDOW_WIDTH,
             BLOOD_WINDOW_HEIGHT,
         )
+
         try:
             initial_region = get_client_rect_on_screen(hwnd)
             cv2.moveWindow(
@@ -1544,337 +1622,405 @@ def main():
         except Exception:
             pass
 
-
     last_window_guard_reason = None
     last_window_guard_log_time = 0
 
-    while True:
-        region = get_client_rect_on_screen(hwnd)
+    grabber = RegionGrabber()
 
-        occluded, reason = is_capture_region_occluded(hwnd, region)
-
-        if occluded:
+    try:
+        while True:
+            loop_start = time.perf_counter()
             now = time.time()
 
-            if (
-                reason != last_window_guard_reason
-                or now - last_window_guard_log_time > 1.0
-            ):
-                print(f"[WindowGuard] Freeze recognition: {reason}")
-                last_window_guard_reason = reason
-                last_window_guard_log_time = now
+            t0 = time.perf_counter()
+            region = get_client_rect_on_screen(hwnd)
+            occluded, reason = is_capture_region_occluded(hwnd, region)
+            profiler.add("window_guard", time.perf_counter() - t0)
 
-            time.sleep(0.05)
-
-            key = read_key()
-
-            if is_quit_key(key):
-                break
-
-            continue
-
-        frame = grab_region(region)
-
-        if frame is None:
-            time.sleep(0.05)
-
-            key = read_key()
-
-            if is_quit_key(key):
-                break
-
-            continue
-
-        cell_results, board = board_recognizer.recognize(frame)
-
-        now = time.time()
-
-        if theme_reset_on_round_change:
-            board_signature, board_plant_count = make_board_signature(cell_results)
-
-            if locked_theme is not None and last_board_signature is not None:
-                changed_cells = count_signature_changes(
-                    last_board_signature,
-                    board_signature,
-                )
-
+            if occluded:
                 if (
-                    board_plant_count >= round_change_min_plants
-                    and changed_cells >= round_change_min_changed_cells
-                    and now - last_theme_reset_time >= round_change_cooldown
+                    reason != last_window_guard_reason
+                    or now - last_window_guard_log_time > 1.0
                 ):
-                    if stable_theme_recognizer is not None:
-                        stable_theme_recognizer.reset()
+                    print(f"[WindowGuard] Freeze recognition: {reason}")
+                    last_window_guard_reason = reason
+                    last_window_guard_log_time = now
 
-                    print(
-                        "[Theme] Board changed: "
-                        f"changed_cells={changed_cells}, "
-                        f"plants={board_plant_count}. "
-                        "Reset theme lock for new round."
+                time.sleep(0.05)
+
+                key = read_key()
+                if is_quit_key(key):
+                    break
+
+                profiler.maybe_log()
+                continue
+
+            t0 = time.perf_counter()
+            frame = grabber.grab(region)
+            profiler.add("capture", time.perf_counter() - t0)
+
+            if frame is None:
+                time.sleep(0.05)
+
+                key = read_key()
+                if is_quit_key(key):
+                    break
+
+                profiler.maybe_log()
+                continue
+
+            t0 = time.perf_counter()
+            cell_results, board = board_recognizer.recognize(frame)
+            profiler.add("recognize", time.perf_counter() - t0)
+
+            now = time.time()
+
+            if theme_reset_on_round_change:
+                t0 = time.perf_counter()
+                board_signature, board_plant_count = make_board_signature(cell_results)
+
+                if locked_theme is not None and last_board_signature is not None:
+                    changed_cells = count_signature_changes(
+                        last_board_signature,
+                        board_signature,
                     )
 
-                    locked_theme = None
-                    last_theme_result = None
-                    last_theme_log_text = None
-                    last_breaker_log_text = None
-                    last_blood_mode_log_text = None
-                    last_theme_reset_time = now
+                    if (
+                        board_plant_count >= round_change_min_plants
+                        and changed_cells >= round_change_min_changed_cells
+                        and now - last_theme_reset_time >= round_change_cooldown
+                    ):
+                        if stable_theme_recognizer is not None:
+                            stable_theme_recognizer.reset()
 
-            last_board_signature = board_signature
+                        print(
+                            "[Theme] Board changed: "
+                            f"changed_cells={changed_cells}, "
+                            f"plants={board_plant_count}. "
+                            "Reset theme lock for new round."
+                        )
 
-        theme_result = last_theme_result
+                        locked_theme = None
+                        last_theme_result = None
+                        last_theme_log_text = None
+                        last_breaker_log_text = None
+                        last_blood_mode_log_text = None
+                        last_theme_reset_time = now
 
-        if stable_theme_recognizer is not None:
-            should_log_theme = False
+                        # 新一关后缓存必须清空。
+                        last_ize_signature = None
+                        cached_ize_board = None
+                        cached_strategy_board = None
+                        cached_blood_table = None
+                        cached_blood_error_text = blood_import_error_text
+                        cached_break_plan = None
 
-            if locked_theme is None:
-                theme_result = stable_theme_recognizer.update(
-                    cell_results,
-                    max_col=theme_max_col,
-                )
-                last_theme_result = theme_result
-                should_log_theme = theme_log_until_locked
+                last_board_signature = board_signature
+                profiler.add("round_check", time.perf_counter() - t0)
 
-                if theme_result.get("stable"):
-                    locked_theme = theme_result.get("stable_theme")
-                    theme_result = make_locked_theme_result(
-                        locked_theme,
-                        theme_result,
-                    )
-                    last_theme_result = theme_result
+            theme_result = last_theme_result
 
-                    print(
-                        f"\n[Theme] Locked theme: "
-                        f"{theme_display_name(locked_theme)}({locked_theme})\n"
-                    )
+            if stable_theme_recognizer is not None:
+                t0 = time.perf_counter()
+                should_log_theme = False
 
-            else:
-                if theme_check_after_locked:
-                    theme_result = theme_recognizer.recognize(
+                if locked_theme is None:
+                    theme_result = stable_theme_recognizer.update(
                         cell_results,
                         max_col=theme_max_col,
                     )
-                    theme_result["stable"] = True
-                    theme_result["stable_theme"] = locked_theme
                     last_theme_result = theme_result
+                    should_log_theme = theme_log_until_locked
+
+                    if theme_result.get("stable"):
+                        locked_theme = theme_result.get("stable_theme")
+                        theme_result = make_locked_theme_result(
+                            locked_theme,
+                            theme_result,
+                        )
+                        last_theme_result = theme_result
+
+                        # 主题刚锁定，缓存签名要重置，确保算血模式和策略重跑。
+                        last_ize_signature = None
+                        cached_break_plan = None
+
+                        print(
+                            f"\n[Theme] Locked theme: "
+                            f"{theme_display_name(locked_theme)}({locked_theme})\n"
+                        )
                 else:
-                    theme_result = make_locked_theme_result(
+                    if theme_check_after_locked:
+                        theme_result = theme_recognizer.recognize(
+                            cell_results,
+                            max_col=theme_max_col,
+                        )
+                        theme_result["stable"] = True
+                        theme_result["stable_theme"] = locked_theme
+                        last_theme_result = theme_result
+                    else:
+                        theme_result = make_locked_theme_result(
+                            locked_theme,
+                            last_theme_result,
+                        )
+                        last_theme_result = theme_result
+
+                    should_log_theme = theme_log_after_locked
+
+                if should_log_theme:
+                    theme_log_text = format_theme_log(theme_result, locked_theme)
+
+                    if (
+                        theme_log_text != last_theme_log_text
+                        or now - last_theme_log_time >= 1.0
+                    ):
+                        print(theme_log_text)
+                        last_theme_log_text = theme_log_text
+                        last_theme_log_time = now
+
+                profiler.add("theme", time.perf_counter() - t0)
+
+            correction_info = None
+            memory_correction_info = None
+
+            if locked_theme is not None:
+                t0 = time.perf_counter()
+
+                if getattr(board_recognizer, "memory_initialized", False):
+                    memory_correction_info = board_corrector.correct_board_memory(
+                        board_recognizer.board_memory,
                         locked_theme,
-                        last_theme_result,
+                        max_col=theme_max_col,
                     )
-                    last_theme_result = theme_result
 
-                should_log_theme = theme_log_after_locked
-
-            if should_log_theme:
-                theme_log_text = format_theme_log(theme_result, locked_theme)
-
-                if (
-                    theme_log_text != last_theme_log_text
-                    or now - last_theme_log_time >= 1.0
-                ):
-                    print(theme_log_text)
-                    last_theme_log_text = theme_log_text
-                    last_theme_log_time = now
-
-        correction_info = None
-        memory_correction_info = None
-
-        if locked_theme is not None:
-            # 先修正 BoardRecognizer 内部 memory。
-            # 这样下一帧开始，memory 自己就是修正后的结果。
-            if getattr(board_recognizer, "memory_initialized", False):
-                memory_correction_info = board_corrector.correct_board_memory(
-                    board_recognizer.board_memory,
+                cell_results, board, correction_info = board_corrector.correct(
+                    cell_results,
+                    board,
                     locked_theme,
                     max_col=theme_max_col,
                 )
 
-            # 再修正当前这一帧的 cell_results / board，
-            # 这样当前 debug 窗口和后续策略立刻能用修正后的结果。
-            cell_results, board, correction_info = board_corrector.correct(
-                cell_results,
-                board,
-                locked_theme,
-                max_col=theme_max_col,
-            )
+                log_parts = []
 
-            log_parts = []
-
-            if (
-                memory_correction_info is not None
-                and memory_correction_info.get("changed_count", 0) > 0
-            ):
-                log_parts.append(
-                    "[BoardCorrector] memory fixed "
-                    f"{memory_correction_info['changed_count']} cells"
-                )
-
-            if (
-                correction_info is not None
-                and correction_info.get("changed_count", 0) > 0
-            ):
-                changes = correction_info.get("changes", [])
-
-                change_text = ", ".join(
-                    [
-                        f"r{c['row'] + 1}c{c['col'] + 1}:"
-                        f"{c['from']}->{c['to']}"
-                        for c in changes[:8]
-                    ]
-                )
-
-                log_parts.append(
-                    "[BoardCorrector] frame fixed "
-                    f"{correction_info['changed_count']} cells | "
-                    f"{change_text}"
-                )
-
-            if correction_info is not None:
                 if (
-                    correction_info.get("changed_count", 0) > 0
-                    and not correction_info.get("signature_matched_after", False)
+                    memory_correction_info is not None
+                    and memory_correction_info.get("changed_count", 0) > 0
                 ):
                     log_parts.append(
-                        "[BoardCorrector] warning: signature still mismatched "
-                        f"after correction. after={correction_info.get('after_counts')}, "
-                        f"expected={correction_info.get('expected_counts')}"
+                        "[BoardCorrector] memory fixed "
+                        f"{memory_correction_info['changed_count']} cells"
                     )
 
-            if log_parts:
-                corrector_log_text = "\n".join(log_parts)
+                if (
+                    correction_info is not None
+                    and correction_info.get("changed_count", 0) > 0
+                ):
+                    changes = correction_info.get("changes", [])
+                    change_text = ", ".join(
+                        [
+                            f"r{c['row'] + 1}c{c['col'] + 1}:"
+                            f"{c['from']}->{c['to']}"
+                            for c in changes[:8]
+                        ]
+                    )
+                    log_parts.append(
+                        "[BoardCorrector] frame fixed "
+                        f"{correction_info['changed_count']} cells | "
+                        f"{change_text}"
+                    )
 
-                if corrector_log_text != last_corrector_log_text:
-                    print(corrector_log_text)
-                    last_corrector_log_text = corrector_log_text
+                if correction_info is not None:
+                    if (
+                        correction_info.get("changed_count", 0) > 0
+                        and not correction_info.get("signature_matched_after", False)
+                    ):
+                        log_parts.append(
+                            "[BoardCorrector] warning: signature still mismatched "
+                            f"after correction. after={correction_info.get('after_counts')}, "
+                            f"expected={correction_info.get('expected_counts')}"
+                        )
 
+                if log_parts:
+                    corrector_log_text = "\n".join(log_parts)
+                    if corrector_log_text != last_corrector_log_text:
+                        print(corrector_log_text)
+                        last_corrector_log_text = corrector_log_text
 
-        blood_error_text = blood_import_error_text
-        blood_table = None
-        ize_board = None
+                profiler.add("correct", time.perf_counter() - t0)
 
-        if blood_calculator is not None:
-            try:
-                ize_board = extract_ize_board(board, rows=5, cols=5)
+            blood_error_text = cached_blood_error_text
+            blood_table = cached_blood_table
+            ize_board = cached_ize_board
 
-                check_all_starfruit = (
-                    locked_theme is not None
-                    and str(locked_theme) in tilted_starfruit_themes
-                )
+            if blood_calculator is not None:
+                t0 = time.perf_counter()
 
-                blood_mode_log_text = (
-                    "[BloodCalculator] tilted starfruit mode enabled "
-                    f"for theme={locked_theme}"
-                    if check_all_starfruit
-                    else "[BloodCalculator] normal mode"
-                )
-
-                if blood_mode_log_text != last_blood_mode_log_text:
-                    print(blood_mode_log_text)
-                    last_blood_mode_log_text = blood_mode_log_text
-
-                blood_table = calculate_blood_table(
-                    blood_calculator,
-                    ize_board,
-                    check_all_starfruit=check_all_starfruit,
-                )
-            except Exception as e:
-                blood_error_text = (
-                    f"{type(e).__name__}: {e}"
-                )
-
-        if strategy_router is not None:
-            strategy_theme = locked_theme
-
-            if (
-                strategy_theme is None
-                and not strategy_require_locked_theme
-                and isinstance(theme_result, dict)
-            ):
-                strategy_theme = theme_result.get("stable_theme") or theme_result.get("theme")
-
-            if (
-                strategy_theme is not None
-                and blood_table is not None
-                and ize_board is not None
-            ):
                 try:
-                    context = BreakContext(
-                        theme=strategy_theme,
-                        board_5x5=ize_board,
-                        board_5x9=extract_strategy_board(board, rows=5, cols=9),
-                        blood_table=blood_table,
-                        theme_result=theme_result,
-                        correction_info=correction_info,
-                        config=config,
+                    current_ize_board = extract_ize_board(board, rows=5, cols=5)
+                    check_all_starfruit = (
+                        locked_theme is not None
+                        and str(locked_theme) in tilted_starfruit_themes
                     )
 
-                    break_plan = strategy_router.solve(context)
+                    blood_mode_log_text = (
+                        "[BloodCalculator] tilted starfruit mode enabled "
+                        f"for theme={locked_theme}"
+                        if check_all_starfruit
+                        else "[BloodCalculator] normal mode"
+                    )
 
-                    if strategy_log_plan:
-                        breaker_log_text = format_break_plan_log(break_plan)
+                    if blood_mode_log_text != last_blood_mode_log_text:
+                        print(blood_mode_log_text)
+                        last_blood_mode_log_text = blood_mode_log_text
+
+                    ize_signature = make_ize_signature(
+                        current_ize_board,
+                        locked_theme,
+                        check_all_starfruit,
+                    )
+
+                    if ize_signature != last_ize_signature:
+                        blood_table = calculate_blood_table(
+                            blood_calculator,
+                            current_ize_board,
+                            check_all_starfruit=check_all_starfruit,
+                        )
+                        ize_board = current_ize_board
+
+                        cached_ize_board = current_ize_board
+                        cached_strategy_board = extract_strategy_board(board, rows=5, cols=9)
+                        cached_blood_table = blood_table
+                        cached_blood_error_text = None
+                        cached_break_plan = None
+                        last_ize_signature = ize_signature
+                        blood_error_text = None
+                    else:
+                        blood_table = cached_blood_table
+                        ize_board = cached_ize_board
+                        blood_error_text = cached_blood_error_text
+
+                except Exception as e:
+                    blood_error_text = f"{type(e).__name__}: {e}"
+                    cached_blood_error_text = blood_error_text
+                    blood_table = None
+                    cached_blood_table = None
+                    cached_break_plan = None
+
+                profiler.add("blood", time.perf_counter() - t0)
+
+            if strategy_router is not None:
+                t0 = time.perf_counter()
+
+                strategy_theme = locked_theme
+
+                if (
+                    strategy_theme is None
+                    and not strategy_require_locked_theme
+                    and isinstance(theme_result, dict)
+                ):
+                    strategy_theme = theme_result.get("stable_theme") or theme_result.get("theme")
+
+                if (
+                    strategy_theme is not None
+                    and blood_table is not None
+                    and ize_board is not None
+                ):
+                    try:
+                        if cached_break_plan is None:
+                            context = BreakContext(
+                                theme=strategy_theme,
+                                board_5x5=ize_board,
+                                board_5x9=(
+                                    cached_strategy_board
+                                    or extract_strategy_board(board, rows=5, cols=9)
+                                ),
+                                blood_table=blood_table,
+                                theme_result=theme_result,
+                                correction_info=correction_info,
+                                config=config,
+                            )
+                            cached_break_plan = strategy_router.solve(context)
+
+                        if strategy_log_plan:
+                            breaker_log_text = format_break_plan_log(cached_break_plan)
+
+                            if breaker_log_text != last_breaker_log_text:
+                                print(breaker_log_text)
+                                last_breaker_log_text = breaker_log_text
+                                last_breaker_log_time = now
+
+                    except Exception as e:
+                        breaker_log_text = f"[Breaker] {type(e).__name__}: {e}"
 
                         if breaker_log_text != last_breaker_log_text:
                             print(breaker_log_text)
                             last_breaker_log_text = breaker_log_text
                             last_breaker_log_time = now
 
+                profiler.add("strategy", time.perf_counter() - t0)
 
-                except Exception as e:
-                    breaker_log_text = f"[Breaker] {type(e).__name__}: {e}"
+            if blood_debug_enabled and now - last_blood_debug_draw_time >= blood_debug_interval:
+                t0 = time.perf_counter()
+                blood_vis = draw_blood_table_window(
+                    blood_table,
+                    ize_board=ize_board,
+                    locked_theme=locked_theme,
+                    error_text=blood_error_text,
+                )
+                cv2.imshow(BLOOD_DEBUG_WINDOW_NAME, blood_vis)
+                last_blood_debug_draw_time = now
+                profiler.add("draw_blood", time.perf_counter() - t0)
 
-                    if breaker_log_text != last_breaker_log_text:
-                        print(breaker_log_text)
-                        last_breaker_log_text = breaker_log_text
-                        last_breaker_log_time = now
+            if now - last_board_debug_draw_time >= board_debug_interval:
+                t0 = time.perf_counter()
+                vis = draw_board_results(
+                    frame,
+                    cell_results,
+                    show_confidence=True,
+                )
+                vis = draw_theme_overlay(
+                    vis,
+                    theme_result,
+                    locked_theme,
+                )
+                cv2.imshow("PVZ Board Recognition Debug", vis)
+                last_board_debug_draw_time = now
+                profiler.add("draw_board", time.perf_counter() - t0)
 
+            t0 = time.perf_counter()
+            key = read_key()
+            profiler.add("wait_key", time.perf_counter() - t0)
 
-        if blood_debug_enabled:
-            blood_vis = draw_blood_table_window(
-                blood_table,
-                ize_board=ize_board,
-                locked_theme=locked_theme,
-                error_text=blood_error_text,
-            )
-            cv2.imshow(BLOOD_DEBUG_WINDOW_NAME, blood_vis)
+            if is_reset_theme_key(key):
+                if stable_theme_recognizer is not None:
+                    stable_theme_recognizer.reset()
 
+                locked_theme = None
+                last_theme_result = None
+                last_theme_log_text = None
+                last_board_signature = None
+                last_corrector_log_text = None
+                last_breaker_log_text = None
+                last_blood_mode_log_text = None
+                last_theme_reset_time = time.time()
 
-        vis = draw_board_results(
-            frame,
-            cell_results,
-            show_confidence=True,
-        )
+                last_ize_signature = None
+                cached_ize_board = None
+                cached_strategy_board = None
+                cached_blood_table = None
+                cached_blood_error_text = blood_import_error_text
+                cached_break_plan = None
 
-        vis = draw_theme_overlay(
-            vis,
-            theme_result,
-            locked_theme,
-        )
+                print("[Theme] Reset locked theme.")
 
-        cv2.imshow("PVZ Board Recognition Debug", vis)
+            if is_quit_key(key):
+                break
 
+            profiler.add("loop_total", time.perf_counter() - loop_start)
+            profiler.maybe_log()
 
-        key = read_key()
-
-        if is_reset_theme_key(key):
-            if stable_theme_recognizer is not None:
-                stable_theme_recognizer.reset()
-
-            locked_theme = None
-            last_theme_result = None
-            last_theme_log_text = None
-            last_board_signature = None
-            last_corrector_log_text = None
-            last_breaker_log_text = None
-            last_blood_mode_log_text = None
-            last_theme_reset_time = time.time()
-            print("[Theme] Reset locked theme.")
-
-
-        if is_quit_key(key):
-            break
-
-    cv2.destroyAllWindows()
+    finally:
+        grabber.close()
+        cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":

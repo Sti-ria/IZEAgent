@@ -11,7 +11,9 @@ DEFAULT_IMAGE_SIZE = (64, 64)
 def imread_unicode(path):
     """
     支持中文路径的图片读取。
-    Windows 下 cv2.imread 遇到中文路径有时会失败，所以用 np.fromfile + cv2.imdecode。
+
+    Windows 下 cv2.imread 遇到中文路径有时会失败，
+    所以用 np.fromfile + cv2.imdecode。
     """
     path = str(path)
     data = np.fromfile(path, dtype=np.uint8)
@@ -38,7 +40,7 @@ def create_hog_descriptor(image_size=DEFAULT_IMAGE_SIZE):
     )
 
 
-def extract_features(image, image_size=DEFAULT_IMAGE_SIZE):
+def extract_features(image, image_size=DEFAULT_IMAGE_SIZE, hog_descriptor=None):
     """
     从一个格子图片中提取特征。
 
@@ -47,11 +49,8 @@ def extract_features(image, image_size=DEFAULT_IMAGE_SIZE):
     2. HSV 小缩略图：保留大致空间布局
     3. HOG：保留植物轮廓形状
 
-    输入：
-        image: BGR 格式图片
-
-    输出：
-        一维 float32 特征向量
+    性能优化：
+    - hog_descriptor 可以从 PlantClassifier 里复用，避免每个格子重复创建 HOG 对象。
     """
     if image is None or image.size == 0:
         raise ValueError("Empty image passed to extract_features")
@@ -80,7 +79,7 @@ def extract_features(image, image_size=DEFAULT_IMAGE_SIZE):
 
     # 3. HOG 形状特征
     gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
-    hog = create_hog_descriptor(image_size)
+    hog = hog_descriptor or create_hog_descriptor(image_size)
     hog_feat = hog.compute(gray)
 
     if hog_feat is None:
@@ -92,7 +91,6 @@ def extract_features(image, image_size=DEFAULT_IMAGE_SIZE):
     hog_feat = hog_feat / hog_norm
 
     feature = np.concatenate([hist, thumb, hog_feat]).astype(np.float32)
-
     return feature
 
 
@@ -122,6 +120,9 @@ class PlantClassifier:
         self.class_names = None
         self.image_size = DEFAULT_IMAGE_SIZE
 
+        # 性能优化：HOG descriptor 创建很频繁，缓存起来复用。
+        self.hog_descriptor = None
+
         self.load()
 
     def load(self):
@@ -145,6 +146,9 @@ class PlantClassifier:
 
         if "k" in data:
             self.k = int(data["k"][0])
+
+        # 性能优化：模型加载后根据最终 image_size 创建一次 HOG。
+        self.hog_descriptor = create_hog_descriptor(self.image_size)
 
         print("Loaded plant classifier:")
         print(f"- model: {self.model_path}")
@@ -171,7 +175,11 @@ class PlantClassifier:
                 "raw_label": "unknown",
             }
 
-        feature = extract_features(image, self.image_size)
+        feature = extract_features(
+            image,
+            self.image_size,
+            hog_descriptor=self.hog_descriptor,
+        )
         feature = (feature - self.mean) / self.std
 
         diff = self.features - feature.reshape(1, -1)
@@ -181,7 +189,6 @@ class PlantClassifier:
         nearest_idx = np.argpartition(distances, k - 1)[:k]
 
         label_scores = {}
-
         for idx in nearest_idx:
             label_id = int(self.labels[idx])
             dist = float(distances[idx])
@@ -191,11 +198,10 @@ class PlantClassifier:
             label_scores[label_id] = label_scores.get(label_id, 0.0) + weight
 
         total_score = sum(label_scores.values())
-
         best_label_id = max(label_scores, key=label_scores.get)
         best_score = label_scores[best_label_id]
-        confidence = best_score / total_score if total_score > 0 else 0.0
 
+        confidence = best_score / total_score if total_score > 0 else 0.0
         raw_label = self.class_names[best_label_id]
 
         if confidence < self.unknown_threshold:
