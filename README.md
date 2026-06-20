@@ -2,7 +2,7 @@
 
 PVZAgent 是一个面向《植物大战僵尸》我是僵尸无尽（I, Zombie, Endless / IZE）模式的计算机视觉与破阵辅助项目。
 
-项目当前已经串起了一条完整的调试链路：
+项目当前已经串起完整的实时调试链路：
 
 ```text
 PVZ 窗口截图
@@ -18,19 +18,19 @@ PVZ 窗口截图
   → OpenCV 可视化调试
 ```
 
-项目目前主要用于实时识别 IZE 棋盘、判断主题、计算算血参考、检测当前是否需要重新破阵，并根据主题策略输出 `BreakPlan`。当前推荐入口是：
+项目当前定位是 **识别、算血、全场状态判断和破阵策略输出**。目前不做自动点击控制，不接入 controller 自动下僵尸。
+
+当前推荐入口是：
 
 ```bash
 python .\tools\debug_board_recognition.py
 ```
 
-`main.py` 是早期自动操作入口，目前不作为主要调试入口。后续如果要做自动点击，可以把现在 `debug_board_recognition.py` 中已经稳定的识别、状态、算血和策略链路封装后接回 controller。
-
 ---
 
 ## 1. 当前项目状态
 
-当前已经完成或基本完成的内容包括：
+当前已经完成的内容包括：
 
 - 自动查找 PVZ 游戏窗口，并获取游戏客户区截图；
 - 根据配置好的棋盘参数切分 5 行 × 9 列棋盘格；
@@ -44,18 +44,25 @@ python .\tools\debug_board_recognition.py
 - 新增算血 Debug 窗口，可实时显示每一路的算血结果；
 - 新增破阵策略统一接口：`BreakContext`、`BreakPlan`、`BreakAction`；
 - 新增主题破阵路由器：`ThemeBreakerRouter`；
-- 新增并完善 `strategies/` 目录下除 `hybrid.py` 外的主题破阵策略；
+- `strategies/` 目录下 8 个主题破阵策略已经全部完成；
 - 新增全场状态检测：脑子是否存在、场上是否还有僵尸、是否允许重新破阵；
-- 新增基于稳定帧的无僵尸判定：当棋盘植物状态和脑子状态连续若干帧不变化时，可认为场上无活僵尸；
+- 新增“格子识别变化 => 立刻认为场上有僵尸”的活动检测逻辑；
+- 新增“棋盘植物状态 + 脑子状态连续稳定若干帧 => 认为场上无僵尸”的稳定判定逻辑；
 - 新增策略安全过滤：只从仍有脑子的行中选择目标，避免继续攻击已经没有脑子的路；
 - 新增自动重规划门控：只有“场上无僵尸 + 仍有脑子”时才重新调用破阵策略；
 - 降低终端刷屏：FieldStatus 和 Breaker 日志只在关键状态变化或产生有效计划时输出；
 - 提供独立算血调试工具、独立策略路由调试工具、训练数据采集工具、植物分类器训练工具等。
 
-当前真实调试链路已经是：
+当前真实调试链路是：
 
 ```text
-棋盘识别 → 主题识别 → 主题纠错 → 算血 → 全场状态检测 → 主题破阵策略路由 → 输出 BreakPlan
+棋盘识别
+  → 主题识别
+  → 主题纠错
+  → 算血
+  → 全场状态检测
+  → 主题破阵策略路由
+  → 输出 BreakPlan
 ```
 
 ---
@@ -149,6 +156,8 @@ blood_calculator:
   debug_window_enabled: false
 ```
 
+---
+
 ### 3.2 独立调试 IZE 血量计算器
 
 ```bash
@@ -173,6 +182,14 @@ python .\tools\debug_ize_blood_calculator.py --board "empty,empty,empty,empty,em
 python .\tools\debug_ize_blood_calculator.py --lane "empty,empty,empty,snowpea,empty" --explain
 ```
 
+输出 JSON：
+
+```bash
+python .\tools\debug_ize_blood_calculator.py --json --lane "snowpea,repeater,wallnut,empty,puffshroom"
+```
+
+---
+
 ### 3.3 独立调试主题破阵策略接口
 
 ```bash
@@ -185,7 +202,9 @@ python .\tools\debug_breaker_router.py
 综合 / 控制 / 即死 / 输出 / 爆炸 / 倾斜 / 穿刺 / 回复
 ```
 
-当前除 `hybrid.py` 外，其余主题策略已经实现或更新。`debug_breaker_router.py` 适合用来快速检查策略文件是否能正常返回 `BreakPlan`，不需要每次打开游戏窗口。
+8 个主题策略均已实现，可以通过该脚本快速检查策略文件是否能正常返回 `BreakPlan`。
+
+---
 
 ### 3.4 采集植物格子训练样本
 
@@ -198,6 +217,8 @@ python .\tools\extract_plant_cells.py
 ```text
 assets/templates/plants_raw/batch_时间戳/
 ```
+
+---
 
 ### 3.5 训练植物分类模型
 
@@ -223,7 +244,6 @@ PVZAgent/
 │  └─ plants_labeled.zip
 ├─ config/
 │  ├─ settings.yaml
-│  ├─ local_settings.yaml
 │  └─ theme_signatures.yaml
 ├─ core/
 │  ├─ board_adapter.py
@@ -298,9 +318,18 @@ PVZAgent/
 cell_results, board = board_recognizer.recognize(frame)
 ```
 
+---
+
 ### 5.2 `core/theme_recognizer.py`
 
 IZE 主题识别模块。
+
+主要类：
+
+```python
+ThemeRecognizer
+StableThemeRecognizer
+```
 
 主题识别只统计前 5 列：
 
@@ -314,6 +343,8 @@ IZE 主题识别模块。
 综合 / 控制 / 即死 / 输出 / 爆炸 / 倾斜 / 穿刺 / 回复
 ```
 
+---
+
 ### 5.3 `core/board_corrector.py`
 
 基于主题先验的棋盘纠错模块，用于在主题锁定后修正容易混淆的植物识别结果，例如：
@@ -323,6 +354,8 @@ peashooter / repeater
 ```
 
 纠错范围主要是 IZE 初始区域，即前 5 列。
+
+---
 
 ### 5.4 `core/ize_blood_calculator.py`
 
@@ -379,11 +412,11 @@ pole_ladder 撑杆梯子
 - 梯子类结果使用 `a+b` 格式表示梯子血量 + 僵尸本体血量；
 - 撑杆逻辑加入跳前行走伤害修正。
 
+---
+
 ### 5.5 `core/field_status_detector.py`
 
-全场状态检测模块。
-
-这是最近新增的重要模块，用于回答三个问题：
+全场状态检测模块，用于回答三个问题：
 
 ```text
 1. 每一路脑子是否还存在？
@@ -422,7 +455,7 @@ should_replan = (
 - 因为当前策略大多是单路破阵，舞王可能影响多路，按全场有无僵尸判断更稳；
 - 只要场上还有任意僵尸，就等待当前进攻结束；
 - 场上没有僵尸且仍有脑子时，才允许重新调用破阵策略；
-- 如果所有脑子都消失，则认为当前关卡已经完成或无需继续破阵。
+- 如果所有脑子都消失，则当前不再需要破阵。
 
 脑子检测：
 
@@ -431,19 +464,38 @@ should_replan = (
 - 默认采用单向状态：`alive -> dead`；
 - 脑子一旦判定消失，本关内不会自动恢复，除非手动或新关卡 reset。
 
-僵尸检测：
+全场僵尸检测由三类信号共同决定：
 
-- 使用全场 ROI；
-- 基于背景差分、运动差分和连通域过滤判断场上是否可能存在僵尸；
-- 采用“检测到僵尸反应快，确认无僵尸反应慢”的防抖机制。
+```text
+1. 格子识别变化：
+   只要任意格子的识别签名发生变化，立即认为场上有僵尸。
+   在 IZE 中，格子变化通常来自僵尸运动、植物子弹、爆炸、植物被吃等。
 
-稳定帧无僵尸纠错：
+2. 原始视觉检测：
+   使用背景差分、运动差分和连通域过滤判断场上是否可能存在僵尸。
 
-- 背景差分容易把植物动画、残影、子弹、灰尘误判为僵尸；
-- 因此新增稳定帧纠错逻辑；
-- 当“所有格子植物判定 + 所有脑子判定”连续若干帧没有变化时，可以强制认为场上没有活僵尸；
-- 该逻辑由 `field_status.zombie.use_stability_absence` 控制；
-- 连续稳定帧数由 `field_status.zombie.stability_absence_frames` 控制。
+3. 稳定无僵尸判定：
+   如果“所有格子植物判定 + 所有脑子判定”连续若干帧不变化，
+   则认为场上没有活僵尸。
+```
+
+当前用于测试的推荐参数是：
+
+```yaml
+field_status:
+  zombie:
+    activity_present_hold_frames: 0
+    stability_absence_frames: 4
+```
+
+也就是说：
+
+```text
+格子一变化，立刻判定有僵尸；
+格子和脑子连续 4 帧稳定，判定无僵尸。
+```
+
+---
 
 ### 5.6 `core/breaker_types.py`
 
@@ -497,7 +549,9 @@ context.is_row_allowed(row)
 context.candidate_rows()
 ```
 
-会返回仍有脑子的行。策略应优先只从这些行中选择目标。
+会返回仍有脑子的行。策略应只从这些行中选择目标。
+
+---
 
 ### 5.7 `core/breaker_router.py`
 
@@ -525,7 +579,7 @@ context.candidate_rows()
 }
 ```
 
-新增安全过滤：
+安全过滤：
 
 - 已无脑子的行不会继续下僵尸；
 - 自动重规划模式下可以只保留一个目标行，避免多路同时出僵尸；
@@ -554,13 +608,6 @@ context.candidate_rows()
   → 绘制棋盘、主题、算血、全场状态
 ```
 
-终端日志当前应该尽量保持克制：
-
-- 不持续打印性能 profiler；
-- 不打印冷却中状态；
-- 不持续打印空 BreakPlan；
-- 只在主题锁定、全场状态关键变化、产生有效破阵计划、纠错变化时输出。
-
 策略调用门控：
 
 ```text
@@ -574,11 +621,18 @@ context.candidate_rows()
     不调用破阵策略
 ```
 
+终端日志当前应该尽量保持克制：
+
+- 不持续打印性能 profiler；
+- 不打印冷却中状态；
+- 不持续打印空 BreakPlan；
+- 只在主题锁定、全场状态关键变化、产生有效破阵计划、纠错变化时输出。
+
 ---
 
 ## 7. `strategies/` 主题破阵策略
 
-`strategies/` 是当前策略开发的主要目录。
+`strategies/` 是主题破阵逻辑目录。
 
 文件对应关系：
 
@@ -596,8 +650,7 @@ strategies/recovery.py     回复
 当前状态：
 
 ```text
-hybrid.py：综合主题仍保留为待完善 / 占位策略
-其余主题：已经更新了对应破阵策略
+8 个主题策略均已完成。
 ```
 
 每个主题文件都应该实现：
@@ -607,7 +660,7 @@ def solve(context: BreakContext) -> BreakPlan:
     ...
 ```
 
-策略文件只应该依赖 `BreakContext`，不要直接调用 OpenCV、BoardRecognizer、截图器或鼠标控制器。
+策略文件只依赖 `BreakContext`，不直接访问 OpenCV 图像、BoardRecognizer、截图器或鼠标控制器。
 
 推荐策略基本结构：
 
@@ -697,6 +750,8 @@ window:
     - "植物大战僵尸"
 ```
 
+---
+
 ### 8.2 棋盘配置
 
 ```yaml
@@ -709,6 +764,8 @@ grid:
   board_height: 500
   crop_padding_ratio: 0.08
 ```
+
+---
 
 ### 8.3 主题识别配置
 
@@ -723,6 +780,8 @@ theme:
 ```
 
 `max_col: 4` 表示使用前 5 列，即 `c0-c4`。
+
+---
 
 ### 8.4 算血配置
 
@@ -740,6 +799,8 @@ blood_calculator:
   debug_window_enabled: false
 ```
 
+---
+
 ### 8.5 策略配置
 
 ```yaml
@@ -747,7 +808,6 @@ strategy:
   enabled: true
   log_plan: true
   require_locked_theme: true
-  execute_actions: false
 
   filter_dead_brain_rows: true
   single_replan_lane: true
@@ -759,14 +819,15 @@ strategy:
 enabled：是否启用主题破阵策略路由
 log_plan：是否在终端输出 BreakPlan
 require_locked_theme：是否必须等主题锁定后才调用策略
-execute_actions：是否执行自动点击，当前建议保持 false
 filter_dead_brain_rows：是否过滤已经没有脑子的行
 single_replan_lane：自动重规划时是否只保留一个目标行
 ```
 
+---
+
 ### 8.6 全场状态检测配置
 
-建议放入 `config/local_settings.yaml`：
+当前更适合测试的推荐配置如下，建议放入 `config/local_settings.yaml`：
 
 ```yaml
 field_status:
@@ -798,11 +859,18 @@ field_status:
     one_way_dead: true
 
   zombie:
-    # 是否启用“稳定若干帧后强制认为无僵尸”的纠错逻辑。
+    # 格子识别一变，立刻认为场上有僵尸。
+    use_activity_presence: true
+
+    # 测试配置：不额外保持有僵尸状态。
+    # 只依赖下一帧是否继续变化，以及稳定无僵尸判定。
+    activity_present_hold_frames: 0
+
+    # 稳定无僵尸判定。
     use_stability_absence: true
 
-    # 连续多少帧“植物判定 + 脑子判定”都不变，就认为场上无僵尸。
-    stability_absence_frames: 18
+    # 测试配置：连续 4 帧“植物判定 + 脑子判定”都不变，就认为场上无僵尸。
+    stability_absence_frames: 4
 
     # 原有视觉僵尸检测参数。
     extend_left_ratio: 0.15
@@ -817,29 +885,26 @@ field_status:
     min_component_height: 36
     min_motion_area: 120
 
-    # 有僵尸反应快，无僵尸确认慢。
     present_confirm_frames: 2
     absent_confirm_frames: 14
 
     background_update_alpha: 0.03
 
-    # 后续接自动点击时，放僵尸后短时间不允许重复重规划。
+    # 当前不做自动点击，该字段主要作为内部状态保护。
     after_place_grace_seconds: 1.0
 ```
 
-调参建议：
+这组测试配置的含义是：
 
-```yaml
-# 如果明明没有僵尸，却长期认为有僵尸：
-field_status:
-  zombie:
-    stability_absence_frames: 12
+```text
+activity_present_hold_frames: 0
+    格子识别变化的那一帧立即认为有僵尸，但不额外延长保持时间。
 
-# 如果僵尸还在啃东西，却过早认为无僵尸：
-field_status:
-  zombie:
-    stability_absence_frames: 25
+stability_absence_frames: 4
+    如果之后连续 4 帧格子和脑子状态稳定，就认为场上无僵尸。
 ```
+
+---
 
 ### 8.7 Debug UI 和性能日志配置
 
@@ -875,6 +940,8 @@ window:
 python .\test_window.py
 ```
 
+---
+
 ### 9.2 棋盘格子位置不对
 
 调整：
@@ -888,6 +955,8 @@ grid:
 ```
 
 可以通过 `tools/extract_plant_cells.py` 生成网格预览图辅助调参。
+
+---
 
 ### 9.3 缺少模型文件
 
@@ -903,6 +972,8 @@ Plant classifier model not found: models/plant_cell_classifier.npz
 python .\tools\train_plant_classifier.py
 ```
 
+---
+
 ### 9.4 算血窗口不显示或显示不可用
 
 检查：
@@ -916,6 +987,8 @@ blood_calculator:
   debug_window_enabled: false
 ```
 
+---
+
 ### 9.5 主题锁定后没有 Breaker 输出
 
 检查：
@@ -927,7 +1000,7 @@ strategy:
   require_locked_theme: true
 ```
 
-并确认对应主题文件存在，例如主题是 `输出` 时，需要：
+并确认当前主题对应策略文件存在，例如主题是 `输出` 时，需要：
 
 ```text
 strategies/output.py
@@ -948,102 +1021,45 @@ python .\tools\debug_breaker_router.py
 
 确认策略路由是否正常。
 
+---
+
 ### 9.6 明明没有僵尸，却一直判断有僵尸
 
-优先检查 `field_status.zombie.use_stability_absence` 是否打开：
+检查：
 
 ```yaml
 field_status:
   zombie:
     use_stability_absence: true
-    stability_absence_frames: 18
+    stability_absence_frames: 4
 ```
 
-如果仍然误判，可以把稳定帧数调小：
+如果仍然误判，可以继续观察 FieldStatus 调试窗口中的稳定帧计数是否增长。
+
+---
+
+### 9.7 放下僵尸后系统没有及时认为有僵尸
+
+检查：
 
 ```yaml
 field_status:
   zombie:
-    stability_absence_frames: 12
+    use_activity_presence: true
+    activity_present_hold_frames: 0
 ```
 
-### 9.7 僵尸还在场上，却过早重新破阵
+并观察 FieldStatus 调试窗口中是否出现：
 
-把稳定帧数调大：
-
-```yaml
-field_status:
-  zombie:
-    stability_absence_frames: 25
+```text
+Activity present: Y
 ```
 
-后续如果接入自动点击，还需要在成功放下僵尸后调用：
-
-```python
-field_status_detector.notify_zombie_placed()
-```
-
-避免刚放下僵尸但视觉检测未稳定时重复出僵尸。
+如果活动信号没有触发，说明当前 `make_board_activity_signature()` 读取到的格子字段变化不明显，需要继续调整 activity signature 包含的字段。
 
 ---
 
-## 10. 当前开发注意事项
-
-当前主入口是：
-
-```text
-tools/debug_board_recognition.py
-```
-
-不是 `main.py`。
-
-当前策略状态：
-
-```text
-hybrid.py：待完善
-control.py：已更新
-instant_kill.py：已更新
-output.py：已更新
-explosion.py：已更新
-diagonal.py：已更新
-piercing.py：已更新
-recovery.py：已更新
-```
-
-暂时不建议：
-
-- 直接开启自动点击；
-- 在策略里直接调用 controller；
-- 在策略里直接访问 OpenCV 图像；
-- 让多个主题策略同时修改全场状态；
-- 在识别不稳定前把 `execute_actions` 设为 `true`。
-
-策略层现在最好只做一件事：
-
-```text
-根据 BreakContext 返回 BreakPlan
-```
-
----
-
-## 11. 后续可继续完善方向
-
-后续可以考虑：
-
-1. 完善 `strategies/hybrid.py`；
-2. 给每个主题策略增加单元测试或样例棋盘；
-3. 将 `debug_board_recognition.py` 中的主流程进一步拆成可复用模块；
-4. 把 `BreakPlan` 接入 `controller.py`，实现自动选择僵尸和下僵尸；
-5. 增加僵尸卡牌识别和阳光识别；
-6. 增加 `config/local_settings.yaml.example`；
-7. 给 `field_status_detector.py` 增加更多 debug 信息，例如稳定帧计数、强制无僵尸原因；
-8. 增加 `requirements.txt` 中缺失依赖，例如 `pywin32`；
-9. 增加更多训练样本，提高植物分类器泛化能力；
-10. 给 `core/ize_blood_calculator.py` 增加单元测试，覆盖撑杆修正、三线射手跨行支援、胆小菇缩头、磁力菇推荐状态等关键规则。
-
----
-
-## 12. 推荐阅读顺序
+## 10. 推荐阅读顺序
 
 ```text
 1. README.md
@@ -1052,10 +1068,10 @@ recovery.py：已更新
 4. core/breaker_types.py
 5. core/field_status_detector.py
 6. core/breaker_router.py
-7. strategies/_template.py
-8. strategies/output.py
-9. strategies/control.py
-10. strategies/instant_kill.py
+7. strategies/hybrid.py
+8. strategies/control.py
+9. strategies/instant_kill.py
+10. strategies/output.py
 11. strategies/explosion.py
 12. strategies/diagonal.py
 13. strategies/piercing.py
@@ -1070,17 +1086,16 @@ recovery.py：已更新
 22. core/grid.py
 23. tools/train_plant_classifier.py
 24. tools/extract_plant_cells.py
-25. main.py
 ```
 
 ---
 
-## 13. 简短交接说明
+## 11. 简短交接说明
 
 当前项目已经从“单纯棋盘识别”扩展为：
 
 ```text
-识别 + 主题 + 纠错 + 算血 + 全场状态检测 + 主题破阵策略
+识别 + 主题 + 纠错 + 算血 + 全场状态检测 + 8 主题破阵策略
 ```
 
 当前最重要的代码链路是：
@@ -1111,12 +1126,10 @@ tools/debug_board_recognition.py
     不再破阵
 ```
 
-当前建议交付标准：
+当前状态总结：
 
-- `debug_board_recognition.py` 能稳定显示棋盘、主题、算血和状态；
-- 主题锁定后能输出有效 BreakPlan；
-- 没有僵尸且仍有脑子时才重新破阵；
-- 已无脑子的行不会继续成为策略目标；
-- 终端不会持续刷屏；
-- `debug_breaker_router.py` 能用于快速测试策略文件；
-- 后续再考虑接入自动点击。
+- `debug_board_recognition.py` 用于真实游戏画面调试；
+- `debug_breaker_router.py` 用于脱离游戏快速测试策略；
+- 8 个主题策略均已完成；
+- 项目当前不做自动点击控制；
+- 主要输出是识别状态、算血结果和 BreakPlan。
