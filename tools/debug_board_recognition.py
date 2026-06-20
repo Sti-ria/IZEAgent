@@ -723,6 +723,121 @@ def make_board_signature(cell_results):
     return tuple(signature), plant_count
 
 
+def _normalize_activity_value(value):
+    if value is None:
+        return ""
+
+    if isinstance(value, float):
+        return round(value, 2)
+
+    if isinstance(value, (int, bool)):
+        return value
+
+    text = str(value).strip()
+
+    if text.lower() in EMPTY_CELL_LABELS:
+        return ""
+
+    return text
+
+
+def make_board_activity_signature(cell_results):
+    """
+    More sensitive signature for activity detection.
+
+    Unlike make_board_signature(), this includes live/raw labels and several
+    visual-state fields when they exist. If a zombie, bullet, explosion, or
+    plant-removal event makes any cell recognition change, this signature should
+    change and FieldStatusDetector will immediately mark the field as zombie-present.
+    """
+    signature = []
+
+    for idx, cell in iter_cells(cell_results):
+        row = get_cell_field(cell, ["row", "r"], default=None)
+        col = get_cell_field(cell, ["col", "column", "c"], default=None)
+
+        if row is None:
+            row = idx // 9
+        if col is None:
+            col = idx % 9
+
+        try:
+            row = int(row)
+            col = int(col)
+        except Exception:
+            row = idx // 9
+            col = idx % 9
+
+        final_label = get_cell_label(cell)
+
+        live_label = get_cell_field(
+            cell,
+            [
+                "live_label",
+                "current_label",
+                "live",
+                "live_pred",
+                "live_prediction",
+                "detected_label",
+            ],
+            default=None,
+        )
+
+        raw_label = get_cell_field(
+            cell,
+            [
+                "raw_label",
+                "raw",
+                "raw_pred",
+                "raw_prediction",
+                "nearest_label",
+            ],
+            default=None,
+        )
+
+        visual_empty = get_cell_field(
+            cell,
+            [
+                "empty_visual",
+                "visual_empty",
+                "is_visual_empty",
+                "empty_visual_clean",
+                "clean_empty",
+            ],
+            default=None,
+        )
+
+        empty_streak = get_cell_field(
+            cell,
+            [
+                "empty_streak",
+                "empty_confirm_frames",
+                "empty_frames",
+            ],
+            default=None,
+        )
+
+        try:
+            empty_streak_bucket = min(int(empty_streak), 3)
+        except Exception:
+            empty_streak_bucket = ""
+
+        signature.append(
+            (
+                row,
+                col,
+                _normalize_activity_value(final_label),
+                _normalize_activity_value(live_label),
+                _normalize_activity_value(raw_label),
+                _normalize_activity_value(visual_empty),
+                empty_streak_bucket,
+            )
+        )
+
+    signature.sort()
+    return tuple(signature)
+
+
 def count_signature_changes(old_signature, new_signature):
     if old_signature is None or new_signature is None:
         return 0
@@ -1508,13 +1623,35 @@ def format_field_status_log(field_state):
 
     alive_rows_text = [int(row) + 1 for row in alive_rows]
 
+    stable_frames = field_state.get("stability_stable_frames")
+    stable_need = field_state.get("stability_absence_frames")
+    activity_hold = field_state.get("activity_present_hold_remaining")
+    activity_flag = field_state.get("force_present_by_activity", False)
+    stable_flag = field_state.get("force_absent_by_stability", False)
+
+    extra_parts = []
+    if stable_frames is not None and stable_need is not None:
+        extra_parts.append(f"stable={stable_frames}/{stable_need}")
+    if activity_hold is not None:
+        extra_parts.append(f"activity_hold={activity_hold}")
+    if activity_flag:
+        extra_parts.append("activity_present=True")
+    if stable_flag:
+        extra_parts.append("stable_absent=True")
+
+    extra_text = ""
+    if extra_parts:
+        extra_text = " | " + " | ".join(extra_parts)
+
     return (
         f"[FieldStatus] brains={alive_rows_text} | "
         f"brain_alive_rows={brain_alive_rows} | "
         f"any_zombie={any_zombie} | "
         f"should_replan={should_replan} | "
         f"{reason}"
+        f"{extra_text}"
     )
+
 
 def get_field_status_log_mode(field_state):
     if not field_state:
@@ -1523,17 +1660,21 @@ def get_field_status_log_mode(field_state):
     has_alive_brain = bool(field_state.get("has_alive_brain", False))
     any_zombie = bool(field_state.get("any_zombie_present", False))
     should_replan = bool(field_state.get("should_replan", False))
+    activity_present = bool(field_state.get("force_present_by_activity", False))
+    stable_absent = bool(field_state.get("force_absent_by_stability", False))
 
     if not has_alive_brain:
         return "no_brain"
+
+    if activity_present:
+        return "activity_present"
 
     if any_zombie:
         return "zombie_alive"
 
     if should_replan:
-        return "ready_replan"
+        return "ready_replan_stable" if stable_absent else "ready_replan"
 
-    # 冷却中、刚放置等待检测稳定等状态都归为 silent
     return "silent"
 
 
@@ -1541,24 +1682,19 @@ def make_field_status_log_key(field_state):
     if not field_state:
         return None
 
-    mode = get_field_status_log_mode(field_state)
-
     return (
         tuple(bool(x) for x in field_state.get("brain_alive_rows", [])),
         tuple(int(x) for x in field_state.get("alive_brain_rows", [])),
         bool(field_state.get("any_zombie_present", False)),
-        mode,
+        bool(field_state.get("should_replan", False)),
+        bool(field_state.get("force_present_by_activity", False)),
+        bool(field_state.get("force_absent_by_stability", False)),
+        get_field_status_log_mode(field_state),
     )
 
 
 def should_print_field_status(field_state):
-    mode = get_field_status_log_mode(field_state)
-
-    # 不打印冷却中 / grace 等中间状态
-    if mode == "silent":
-        return False
-
-    return True
+    return get_field_status_log_mode(field_state) != "silent"
 
 
 def main():
@@ -1749,12 +1885,11 @@ def main():
 
             now = time.time()
 
-            current_board_signature, board_plant_count = make_board_signature(cell_results)
-
+            board_signature, board_plant_count = make_board_signature(cell_results)
+            board_activity_signature = make_board_activity_signature(cell_results)
 
             if theme_reset_on_round_change:
                 t0 = time.perf_counter()
-                board_signature = current_board_signature
 
                 if locked_theme is not None and last_board_signature is not None:
                     changed_cells = count_signature_changes(
@@ -1798,18 +1933,17 @@ def main():
                         last_field_status_log_text = None
                         last_field_status_log_key = None
 
-
                 last_board_signature = board_signature
                 profiler.add("round_check", time.perf_counter() - t0)
 
-            else:
-                board_signature, board_plant_count = make_board_signature(cell_results)
-
-            # 更新全场状态：脑子是否存在 + 全场是否还有僵尸
+            # 更新全场状态：
+            # - stability_signature 用于“连续稳定若干帧 => 无僵尸”
+            # - activity_signature 用于“格子识别一变 => 立刻认为有僵尸”
             t0 = time.perf_counter()
             field_state = field_status_detector.update(
                 frame,
-                stability_signature=current_board_signature,
+                stability_signature=board_signature,
+                activity_signature=board_activity_signature,
             )
             field_status_signature = field_status_detector.state_signature(field_state)
 
@@ -1829,7 +1963,6 @@ def main():
                 last_field_status_log_key = field_status_log_key
 
             profiler.add("field_status", time.perf_counter() - t0)
-
 
             theme_result = last_theme_result
 
@@ -2040,46 +2173,45 @@ def main():
                     try:
                         if cached_break_plan is None:
                             context = BreakContext(
-                            theme=strategy_theme,
-                            board_5x5=ize_board,
-                            board_5x9=(
-                                cached_strategy_board
-                                or extract_strategy_board(board, rows=5, cols=9)
-                            ),
-                            blood_table=blood_table,
-                            theme_result=theme_result,
-                            correction_info=correction_info,
+                                theme=strategy_theme,
+                                board_5x5=ize_board,
+                                board_5x9=(
+                                    cached_strategy_board
+                                    or extract_strategy_board(board, rows=5, cols=9)
+                                ),
+                                blood_table=blood_table,
+                                theme_result=theme_result,
+                                correction_info=correction_info,
 
-                            # Field status: 脑子状态 + 全场僵尸状态 + 是否允许重新破阵
-                            field_state=field_state,
-                            brain_alive_rows=(
-                                field_state.get("brain_alive_rows")
-                                if isinstance(field_state, dict)
-                                else None
-                            ),
-                            alive_brain_rows=(
-                                field_state.get("alive_brain_rows")
-                                if isinstance(field_state, dict)
-                                else None
-                            ),
-                            any_zombie_present=(
-                                bool(field_state.get("any_zombie_present", False))
-                                if isinstance(field_state, dict)
-                                else False
-                            ),
-                            should_replan=(
-                                bool(field_state.get("should_replan", True))
-                                if isinstance(field_state, dict)
-                                else True
-                            ),
+                                field_state=field_state,
+                                brain_alive_rows=(
+                                    field_state.get("brain_alive_rows")
+                                    if isinstance(field_state, dict)
+                                    else None
+                                ),
+                                alive_brain_rows=(
+                                    field_state.get("alive_brain_rows")
+                                    if isinstance(field_state, dict)
+                                    else None
+                                ),
+                                any_zombie_present=(
+                                    bool(field_state.get("any_zombie_present", False))
+                                    if isinstance(field_state, dict)
+                                    else False
+                                ),
+                                should_replan=(
+                                    bool(field_state.get("should_replan", True))
+                                    if isinstance(field_state, dict)
+                                    else True
+                                ),
 
-                            config=config,
-                        )
+                                config=config,
+                            )
 
-                        if not context.should_replan:
-                            cached_break_plan = None
-                        else:
-                            cached_break_plan = strategy_router.solve(context)
+                            if context.should_replan:
+                                cached_break_plan = strategy_router.solve(context)
+                            else:
+                                cached_break_plan = None
 
                         if cached_break_plan is not None and strategy_log_plan:
                             breaker_log_text = format_break_plan_log(cached_break_plan)
@@ -2088,7 +2220,6 @@ def main():
                                 print(breaker_log_text)
                                 last_breaker_log_text = breaker_log_text
                                 last_breaker_log_time = now
-
 
                     except Exception as e:
                         breaker_log_text = f"[Breaker] {type(e).__name__}: {e}"
@@ -2119,7 +2250,6 @@ def main():
                     cell_results,
                     show_confidence=True,
                 )
-
                 vis = field_status_detector.draw_debug(vis, field_state)
 
                 vis = draw_theme_overlay(
@@ -2160,7 +2290,6 @@ def main():
                 last_field_status_signature = None
                 last_field_status_log_text = None
                 last_field_status_log_key = None
-
 
                 print("[Theme] Reset locked theme.")
 

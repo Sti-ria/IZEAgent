@@ -226,30 +226,32 @@ field_status:
     one_way_dead: true
 
   zombie:
+    # 新增：格子识别一变，立刻认为场上有僵尸
+    use_activity_presence: true
+
+    # 识别变化后，至少保持多少帧“有僵尸”状态
+    # 如果你发现刚有变化后很快又误判无僵尸，可以调大，比如 20
+    activity_present_hold_frames: 0
+
+    # 保留：稳定若干帧后认为无僵尸
     use_stability_absence: true
 
-    # 连续多少帧“植物判定 + 脑子判定”都不变，
-    # 就强制认为全场没有僵尸。
-    stability_absence_frames: 8
+    # 连续多少帧“植物判定 + 脑子状态”都不变，才认为无僵尸
+    # 如果过早判无僵尸，就调大；如果长期误判有僵尸，就调小
+    stability_absence_frames: 4
 
-    # 原来的视觉僵尸检测仍保留，作为第一层判断。
-    extend_left_ratio: 0.15
-    extend_right_ratio: 0.75
-    y_margin_ratio: 0.04
-
+    # 原来的视觉僵尸检测参数可以先保留
     bg_diff_threshold: 30
     motion_diff_threshold: 24
-
     min_component_area: 650
     min_component_width: 20
     min_component_height: 36
     min_motion_area: 120
-
     present_confirm_frames: 2
     absent_confirm_frames: 14
     background_update_alpha: 0.03
-
     after_place_grace_seconds: 1.0
+
 
 
 strategy:

@@ -11,7 +11,7 @@ Current strategy assumption:
 - When the whole field has no zombie and some brains are still alive,
   we should call the theme breaker again.
 
-Main outputs:
+Output:
 {
     "brain_alive_rows": [True, True, False, True, False],
     "alive_brain_rows": [0, 1, 3],
@@ -19,11 +19,6 @@ Main outputs:
     "should_replan": False,
     ...
 }
-
-Important new logic:
-- The original zombie detector still uses foreground/motion detection.
-- In addition, if the recognized board signature and brain state remain
-  unchanged for N consecutive frames, we force any_zombie_present=False.
 """
 
 from __future__ import annotations
@@ -56,14 +51,13 @@ class FieldStatusDetector:
     - global zombie present/absent
     - should_replan = has_alive_brain and not any_zombie_present
 
-    Brain state:
-    - By default, brain is one-way: alive -> dead.
-    - It will not become alive again until reset(), unless one_way_dead=False.
-
-    Zombie state:
-    - Primary signal: foreground/motion detection.
-    - Correction signal: if board plant signature + brain state stay unchanged
-      for several frames, force the field to "no zombie".
+    Notes:
+    - Brain state is one-way by default: alive -> dead.
+      It will not become alive again until reset().
+    - Zombie detection uses global foreground/motion detection.
+      It is intentionally conservative:
+        present: fast confirmation
+        absent: slower confirmation
     """
 
     def __init__(self, config: Dict[str, Any]):
@@ -91,6 +85,7 @@ class FieldStatusDetector:
         # -------------------------
         # Brain detection settings
         # -------------------------
+        # If these are None, use automatic ROI around the left side of board.
         self.brain_x1 = brain_cfg.get("x1", None)
         self.brain_x2 = brain_cfg.get("x2", None)
 
@@ -99,6 +94,7 @@ class FieldStatusDetector:
             0.22,
         )
 
+        # Brain is pink/red. Ratio of pink pixels inside ROI.
         self.brain_pink_ratio_threshold = _safe_float(
             brain_cfg.get("pink_ratio_threshold", 0.025),
             0.025,
@@ -175,7 +171,9 @@ class FieldStatusDetector:
             0.03,
         )
 
-        # New: board + brain stability correction.
+        # Board + brain stable absence correction:
+        # If plant recognition and brain states stay unchanged for enough frames,
+        # treat the field as no-zombie. This fixes static false positives.
         self.use_stability_absence = bool(
             zombie_cfg.get("use_stability_absence", True)
         )
@@ -184,8 +182,20 @@ class FieldStatusDetector:
             18,
         )
 
+        # Activity presence correction:
+        # If any grid recognition signature changes, immediately treat the field
+        # as having a zombie. In IZE, such changes are usually caused by zombie
+        # movement, bullets, explosions, or plant removal caused by zombies.
+        self.use_activity_presence = bool(
+            zombie_cfg.get("use_activity_presence", True)
+        )
+        self.activity_present_hold_frames = _safe_int(
+            zombie_cfg.get("activity_present_hold_frames", 14),
+            14,
+        )
+
         # After placing a zombie, the detector may need a few frames to see it.
-        # This prevents immediate duplicate replans.
+        # This manual grace prevents immediate duplicate replans.
         self.after_place_grace_seconds = _safe_float(
             zombie_cfg.get("after_place_grace_seconds", 1.0),
             1.0,
@@ -217,10 +227,16 @@ class FieldStatusDetector:
         self.last_replan_time = 0.0
         self.last_zombie_place_time = 0.0
 
-        # New stability state.
-        self.last_board_brain_signature = None
-        self.board_brain_stable_frames = 0
+        # Stable absence state.
+        self.last_stability_signature = None
+        self.stability_stable_frames = 0
         self.force_absent_by_stability = False
+
+        # Activity presence state.
+        self.last_activity_signature = None
+        self.force_present_by_activity = False
+        self.activity_present_hold_remaining = 0
+        self.activity_change_count = 0
 
         self.last_state = self._make_state(
             brain_scores=[0.0 for _ in range(self.rows)],
@@ -249,9 +265,14 @@ class FieldStatusDetector:
         self.last_replan_time = 0.0
         self.last_zombie_place_time = 0.0
 
-        self.last_board_brain_signature = None
-        self.board_brain_stable_frames = 0
+        self.last_stability_signature = None
+        self.stability_stable_frames = 0
         self.force_absent_by_stability = False
+
+        self.last_activity_signature = None
+        self.force_present_by_activity = False
+        self.activity_present_hold_remaining = 0
+        self.activity_change_count = 0
 
     def notify_zombie_placed(self):
         """
@@ -266,22 +287,22 @@ class FieldStatusDetector:
         self.zombie_present_streak = self.present_confirm_frames
         self.zombie_absent_streak = 0
 
-        # A newly placed zombie means previous stable-empty evidence is invalid.
-        self.last_board_brain_signature = None
-        self.board_brain_stable_frames = 0
-        self.force_absent_by_stability = False
+        self._clear_stability_absence_evidence()
+        self.force_present_by_activity = True
+        self.activity_present_hold_remaining = self.activity_present_hold_frames
 
     def mark_replanned(self):
         """
         Call this after generating or executing a replan.
-
-        In current debug-only mode, you generally should NOT call this after
-        merely printing BreakPlan. Prefer calling notify_zombie_placed() after
-        a real zombie placement.
         """
         self.last_replan_time = time.time()
 
-    def update(self, frame: np.ndarray, stability_signature=None) -> Dict[str, Any]:
+    def update(
+        self,
+        frame: np.ndarray,
+        stability_signature=None,
+        activity_signature=None,
+    ) -> Dict[str, Any]:
         """
         Update field status.
 
@@ -289,11 +310,14 @@ class FieldStatusDetector:
             frame:
                 Current PVZ client frame.
             stability_signature:
-                Board signature from debug_board_recognition.make_board_signature().
-                It should describe all grid cells' recognized plant labels.
-
-        When stability_signature + brain_alive_rows stay unchanged for
-        stability_absence_frames, we force any_zombie_present=False.
+                Usually the stable plant board signature from
+                debug_board_recognition.make_board_signature(cell_results).
+                If this signature and brain states stay unchanged for N frames,
+                the detector may force no-zombie.
+            activity_signature:
+                A more sensitive grid-recognition signature. If this changes
+                from the previous frame, the detector immediately treats the
+                field as having a zombie.
         """
         if frame is None or frame.size == 0 or not self.enabled:
             return self.last_state
@@ -309,21 +333,40 @@ class FieldStatusDetector:
 
         zombie_score, raw_zombie_present, zombie_bbox = self._detect_zombie_raw(frame)
 
-        stable_force_absent = self._update_stability_absence(stability_signature)
+        # If no separate activity signature is provided, fall back to the
+        # stability signature. This keeps the API backward compatible.
+        if activity_signature is None:
+            activity_signature = stability_signature
 
-        if stable_force_absent:
-            # Board plant labels + brain states are stable for enough frames.
-            # Treat the field as having no alive zombies, even if foreground
-            # detection still sees static residue / animation / dust.
-            raw_zombie_present = False
-            zombie_score = 0.0
-            zombie_bbox = None
+        activity_force_present = self._update_activity_presence(activity_signature)
 
-            self.any_zombie_present = False
-            self.zombie_present_streak = 0
-            self.zombie_absent_streak = self.absent_confirm_frames
+        if activity_force_present:
+            # Strongest signal: some grid recognition changed.
+            # Treat as zombie activity immediately and reset stable-empty proof.
+            self._clear_stability_absence_evidence()
+
+            raw_zombie_present = True
+            zombie_score = max(float(zombie_score), 1.0)
+
+            self.any_zombie_present = True
+            self.zombie_present_streak = self.present_confirm_frames
+            self.zombie_absent_streak = 0
         else:
-            self._update_zombie_state(raw_zombie_present)
+            stable_force_absent = self._update_stability_absence(stability_signature)
+
+            if stable_force_absent:
+                # Board plant labels + brain states have been stable long enough.
+                # Treat the field as having no alive zombies, even if foreground
+                # detection still sees static residue / animation / dust.
+                raw_zombie_present = False
+                zombie_score = 0.0
+                zombie_bbox = None
+
+                self.any_zombie_present = False
+                self.zombie_present_streak = 0
+                self.zombie_absent_streak = self.absent_confirm_frames
+            else:
+                self._update_zombie_state(raw_zombie_present)
 
         self.last_zombie_score = zombie_score
         self.last_zombie_bbox = zombie_bbox
@@ -348,13 +391,17 @@ class FieldStatusDetector:
             bool(state.get("any_zombie_present", False)),
             bool(state.get("should_replan", False)),
             bool(state.get("force_absent_by_stability", False)),
+            bool(state.get("force_present_by_activity", False)),
         )
 
     def _normalize_signature_item(self, value):
         if isinstance(value, dict):
             return tuple(
                 sorted(
-                    (self._normalize_signature_item(k), self._normalize_signature_item(v))
+                    (
+                        self._normalize_signature_item(k),
+                        self._normalize_signature_item(v),
+                    )
                     for k, v in value.items()
                 )
             )
@@ -364,21 +411,58 @@ class FieldStatusDetector:
 
         return value
 
-    def _update_stability_absence(self, stability_signature) -> bool:
-        """
-        If all recognized grid plants and all brain states remain unchanged
-        for several frames, force the field to no-zombie.
+    def _clear_stability_absence_evidence(self):
+        self.last_stability_signature = None
+        self.stability_stable_frames = 0
+        self.force_absent_by_stability = False
 
-        This is designed to fix false positives from foreground/motion detection.
-        """
+    def _update_activity_presence(self, activity_signature) -> bool:
+        if not self.use_activity_presence:
+            self.force_present_by_activity = False
+            self.activity_present_hold_remaining = 0
+            return False
+
+        if activity_signature is None:
+            if self.activity_present_hold_remaining > 0:
+                self.activity_present_hold_remaining -= 1
+                self.force_present_by_activity = True
+                return True
+
+            self.force_present_by_activity = False
+            return False
+
+        normalized = self._normalize_signature_item(activity_signature)
+
+        if self.last_activity_signature is None:
+            self.last_activity_signature = normalized
+            self.force_present_by_activity = False
+            self.activity_present_hold_remaining = 0
+            return False
+
+        changed = normalized != self.last_activity_signature
+        self.last_activity_signature = normalized
+
+        if changed:
+            self.activity_change_count += 1
+            self.force_present_by_activity = True
+            self.activity_present_hold_remaining = self.activity_present_hold_frames
+            return True
+
+        if self.activity_present_hold_remaining > 0:
+            self.activity_present_hold_remaining -= 1
+            self.force_present_by_activity = True
+            return True
+
+        self.force_present_by_activity = False
+        return False
+
+    def _update_stability_absence(self, stability_signature) -> bool:
         if not self.use_stability_absence:
             self.force_absent_by_stability = False
             return False
 
         if stability_signature is None:
-            self.last_board_brain_signature = None
-            self.board_brain_stable_frames = 0
-            self.force_absent_by_stability = False
+            self._clear_stability_absence_evidence()
             return False
 
         board_signature = self._normalize_signature_item(stability_signature)
@@ -389,14 +473,14 @@ class FieldStatusDetector:
             brain_signature,
         )
 
-        if combined_signature == self.last_board_brain_signature:
-            self.board_brain_stable_frames += 1
+        if combined_signature == self.last_stability_signature:
+            self.stability_stable_frames += 1
         else:
-            self.last_board_brain_signature = combined_signature
-            self.board_brain_stable_frames = 1
+            self.last_stability_signature = combined_signature
+            self.stability_stable_frames = 1
 
         self.force_absent_by_stability = (
-            self.board_brain_stable_frames >= self.stability_absence_frames
+            self.stability_stable_frames >= self.stability_absence_frames
         )
 
         return self.force_absent_by_stability
@@ -435,13 +519,13 @@ class FieldStatusDetector:
         )
 
         if should_replan and self.force_absent_by_stability:
-            reason = (
-                "棋盘植物与脑子状态连续稳定，判定全场无僵尸，允许重新调用破阵策略"
-            )
+            reason = "棋盘植物与脑子状态连续稳定，判定全场无僵尸，允许重新调用破阵策略"
         elif should_replan:
             reason = "全场无僵尸，且仍有脑子，允许重新调用破阵策略"
         elif not has_alive_brain:
             reason = "没有检测到仍存在的脑子"
+        elif self.any_zombie_present and self.force_present_by_activity:
+            reason = "检测到格子识别发生变化，判定场上有僵尸，等待当前进攻结束"
         elif self.any_zombie_present:
             reason = "场上仍有僵尸，等待当前进攻结束"
         elif in_place_grace:
@@ -463,9 +547,13 @@ class FieldStatusDetector:
             "zombie_bbox": self.last_zombie_bbox,
             "in_place_grace": bool(in_place_grace),
             "replan_cooldown_passed": bool(replan_cooldown_passed),
-            "board_brain_stable_frames": int(self.board_brain_stable_frames),
+            "stability_stable_frames": int(self.stability_stable_frames),
             "stability_absence_frames": int(self.stability_absence_frames),
             "force_absent_by_stability": bool(self.force_absent_by_stability),
+            "force_present_by_activity": bool(self.force_present_by_activity),
+            "activity_present_hold_remaining": int(self.activity_present_hold_remaining),
+            "activity_present_hold_frames": int(self.activity_present_hold_frames),
+            "activity_change_count": int(self.activity_change_count),
         }
 
     def _clip_rect(
@@ -554,9 +642,11 @@ class FieldStatusDetector:
         s = hsv[:, :, 1]
         v = hsv[:, :, 2]
 
-        # Brain is usually pink/red. OpenCV hue range is 0-179.
+        # Brain is usually pink/red.
+        # OpenCV hue range is 0-179.
         pink_mask_1 = (h >= 135) & (h <= 179) & (s >= 35) & (v >= 55)
         pink_mask_2 = (h >= 0) & (h <= 14) & (s >= 45) & (v >= 65)
+
         pink_mask = pink_mask_1 | pink_mask_2
 
         score = float(np.count_nonzero(pink_mask)) / float(pink_mask.size + 1e-6)
@@ -703,11 +793,7 @@ class FieldStatusDetector:
 
         return self.any_zombie_present
 
-    def draw_debug(
-        self,
-        frame: np.ndarray,
-        state: Optional[Dict[str, Any]] = None,
-    ) -> np.ndarray:
+    def draw_debug(self, frame: np.ndarray, state: Optional[Dict[str, Any]] = None) -> np.ndarray:
         if not self.debug_enabled:
             return frame
 
@@ -738,11 +824,7 @@ class FieldStatusDetector:
             )
 
         zx1, zy1, zx2, zy2 = self.zombie_roi(vis)
-        zombie_color = (
-            (0, 180, 255)
-            if state.get("any_zombie_present")
-            else (160, 160, 160)
-        )
+        zombie_color = (0, 180, 255) if state.get("any_zombie_present") else (160, 160, 160)
         cv2.rectangle(vis, (zx1, zy1), (zx2, zy2), zombie_color, 1)
 
         bbox = state.get("zombie_bbox")
@@ -757,22 +839,25 @@ class FieldStatusDetector:
         should_replan = bool(state.get("should_replan"))
         alive_rows = state.get("alive_brain_rows", [])
 
-        stable_frames = int(state.get("board_brain_stable_frames", 0))
-        stable_need = int(state.get("stability_absence_frames", self.stability_absence_frames))
-        force_absent = bool(state.get("force_absent_by_stability", False))
-
         lines = [
             f"Brains alive: {[r + 1 for r in alive_rows]}",
             f"Any zombie: {'Y' if any_zombie else 'N'}",
             f"Should replan: {'Y' if should_replan else 'N'}",
-            f"Stable: {stable_frames}/{stable_need} ForceNoZ:{'Y' if force_absent else 'N'}",
+            (
+                "Activity present: "
+                f"{'Y' if state.get('force_present_by_activity') else 'N'} "
+                f"hold={int(state.get('activity_present_hold_remaining', 0))}"
+            ),
+            (
+                "Stable absent: "
+                f"{int(state.get('stability_stable_frames', 0))}/"
+                f"{int(state.get('stability_absence_frames', 0))} "
+                f"{'Y' if state.get('force_absent_by_stability') else 'N'}"
+            ),
         ]
 
         for idx, line in enumerate(lines):
             color = (0, 0, 255) if should_replan and idx == 2 else (255, 255, 255)
-            if force_absent and idx == 3:
-                color = (0, 255, 255)
-
             cv2.putText(
                 vis,
                 line,
