@@ -210,3 +210,48 @@ debug_ui:
 debug_performance:
   enabled: false
   log_interval: 1.0
+
+field_status:
+  enabled: true
+  replan_cooldown_seconds: 1.5
+
+  debug:
+    enabled: true
+
+  brain:
+    y_margin_ratio: 0.22
+    pink_ratio_threshold: 0.025
+    dead_confirm_frames: 5
+    alive_confirm_frames: 2
+    one_way_dead: true
+
+  zombie:
+    use_stability_absence: true
+
+    # 连续多少帧“植物判定 + 脑子判定”都不变，
+    # 就强制认为全场没有僵尸。
+    stability_absence_frames: 8
+
+    # 原来的视觉僵尸检测仍保留，作为第一层判断。
+    extend_left_ratio: 0.15
+    extend_right_ratio: 0.75
+    y_margin_ratio: 0.04
+
+    bg_diff_threshold: 30
+    motion_diff_threshold: 24
+
+    min_component_area: 650
+    min_component_width: 20
+    min_component_height: 36
+    min_motion_area: 120
+
+    present_confirm_frames: 2
+    absent_confirm_frames: 14
+    background_update_alpha: 0.03
+
+    after_place_grace_seconds: 1.0
+
+
+strategy:
+  filter_dead_brain_rows: true
+  single_replan_lane: true

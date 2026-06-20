@@ -3,11 +3,11 @@
 Shared data structures for theme-breaking strategies.
 
 This file defines the interface between:
-1. board recognition / theme recognition / blood calculator
-2. eight theme-specific breaking strategy files
+1. board recognition / theme recognition / blood calculator / field status
+2. theme-specific breaking strategy files
 
-Teammates who write strategy files should only depend on these classes,
-not on OpenCV, BoardRecognizer, ThemeRecognizer, or debug scripts.
+Strategy files should only depend on these classes, not on OpenCV,
+BoardRecognizer, ThemeRecognizer, or debug scripts.
 """
 
 from __future__ import annotations
@@ -26,13 +26,11 @@ class BreakAction:
 
     col:
         Optional 0-based column index.
-        For early strategy testing, this can stay None.
-        Later, when connected to automatic clicking, this can be used
-        to specify a more precise placement column.
 
     zombie:
         Suggested zombie type, for example:
-        "pole", "slow", "ladder", "football", "pole_ladder".
+        "pole", "slow", "ladder", "football", "pole_ladder",
+        "cone", "bucket", "miner", "imp", "dancer".
     """
 
     zombie: str
@@ -64,22 +62,36 @@ class BreakContext:
     """
     Input passed to each theme strategy.
 
-    Strategy files should mainly use:
+    Common strategy inputs:
         context.theme
         context.board_5x5
         context.blood_table
         context.lane(row)
         context.recommended_modes(row)
         context.mode_value(row, mode)
+
+    New field-status inputs:
+        context.field_state
+        context.alive_brain_rows
+        context.any_zombie_present
+        context.should_replan
+        context.candidate_rows()
     """
 
     theme: str
     board_5x5: List[List[str]]
     blood_table: List[Dict[str, Any]]
-
     board_5x9: Optional[List[List[str]]] = None
     theme_result: Optional[Dict[str, Any]] = None
     correction_info: Optional[Dict[str, Any]] = None
+
+    # New global field status.
+    field_state: Optional[Dict[str, Any]] = None
+    brain_alive_rows: Optional[List[bool]] = None
+    alive_brain_rows: Optional[List[int]] = None
+    any_zombie_present: bool = False
+    should_replan: bool = True
+
     config: Dict[str, Any] = field(default_factory=dict)
 
     def lane(self, row: int) -> List[str]:
@@ -89,13 +101,21 @@ class BreakContext:
         if row < 0 or row >= len(self.blood_table):
             return {}
 
-        return self.blood_table[row].get("values", {})
+        row_result = self.blood_table[row]
+        if not isinstance(row_result, dict):
+            return {}
+
+        return row_result.get("values", {})
 
     def blood_status(self, row: int) -> Dict[str, int]:
         if row < 0 or row >= len(self.blood_table):
             return {}
 
-        return self.blood_table[row].get("status", {})
+        row_result = self.blood_table[row]
+        if not isinstance(row_result, dict):
+            return {}
+
+        return row_result.get("status", {})
 
     def mode_value(self, row: int, mode: str) -> Any:
         return self.blood_values(row).get(mode)
@@ -116,9 +136,51 @@ class BreakContext:
             return 0
 
         empty_labels = {"", "empty", "unknown", "none", "null"}
-
         return sum(
             1
             for label in self.board_5x5[row]
             if str(label).strip().lower() not in empty_labels
         )
+
+    def has_brain(self, row: int) -> bool:
+        """
+        Whether this row still has a brain.
+
+        If field status is unavailable, return True for backward compatibility.
+        """
+        if self.brain_alive_rows is not None:
+            if 0 <= row < len(self.brain_alive_rows):
+                return bool(self.brain_alive_rows[row])
+            return False
+
+        if self.field_state is not None:
+            brain_alive_rows = self.field_state.get("brain_alive_rows")
+            if brain_alive_rows is not None:
+                if 0 <= row < len(brain_alive_rows):
+                    return bool(brain_alive_rows[row])
+                return False
+
+        return True
+
+    def candidate_rows(self) -> List[int]:
+        """
+        Rows that are allowed to be considered by a strategy.
+
+        If field status is available, only rows with alive brains are returned.
+        Otherwise all 5 rows are returned.
+        """
+        if self.alive_brain_rows is not None:
+            return [int(row) for row in self.alive_brain_rows if 0 <= int(row) < 5]
+
+        if self.field_state is not None:
+            alive_rows = self.field_state.get("alive_brain_rows")
+            if alive_rows is not None:
+                return [int(row) for row in alive_rows if 0 <= int(row) < 5]
+
+        return list(range(5))
+
+    def has_alive_brain(self) -> bool:
+        return len(self.candidate_rows()) > 0
+
+    def is_row_allowed(self, row: int) -> bool:
+        return row in set(self.candidate_rows())

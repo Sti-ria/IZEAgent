@@ -16,8 +16,10 @@ from core.board_recognizer import BoardRecognizer
 from core.board_debug import draw_board_results
 from core.theme_recognizer import ThemeRecognizer, StableThemeRecognizer
 from core.board_corrector import ThemeBoardCorrector
-from core.breaker_types import BreakContext
+from core.breaker_types import BreakContext, BreakPlan
 from core.breaker_router import ThemeBreakerRouter
+from core.field_status_detector import FieldStatusDetector
+
 
 try:
     from core.ize_blood_calculator import IZEBloodCalculator
@@ -1494,6 +1496,70 @@ def format_break_plan_log(break_plan):
         f"reason={getattr(break_plan, 'reason', '')}"
     )
 
+def format_field_status_log(field_state):
+    if not field_state:
+        return "[FieldStatus] unavailable"
+
+    alive_rows = field_state.get("alive_brain_rows", [])
+    brain_alive_rows = field_state.get("brain_alive_rows", [])
+    any_zombie = bool(field_state.get("any_zombie_present", False))
+    should_replan = bool(field_state.get("should_replan", False))
+    reason = field_state.get("reason", "")
+
+    alive_rows_text = [int(row) + 1 for row in alive_rows]
+
+    return (
+        f"[FieldStatus] brains={alive_rows_text} | "
+        f"brain_alive_rows={brain_alive_rows} | "
+        f"any_zombie={any_zombie} | "
+        f"should_replan={should_replan} | "
+        f"{reason}"
+    )
+
+def get_field_status_log_mode(field_state):
+    if not field_state:
+        return "unavailable"
+
+    has_alive_brain = bool(field_state.get("has_alive_brain", False))
+    any_zombie = bool(field_state.get("any_zombie_present", False))
+    should_replan = bool(field_state.get("should_replan", False))
+
+    if not has_alive_brain:
+        return "no_brain"
+
+    if any_zombie:
+        return "zombie_alive"
+
+    if should_replan:
+        return "ready_replan"
+
+    # 冷却中、刚放置等待检测稳定等状态都归为 silent
+    return "silent"
+
+
+def make_field_status_log_key(field_state):
+    if not field_state:
+        return None
+
+    mode = get_field_status_log_mode(field_state)
+
+    return (
+        tuple(bool(x) for x in field_state.get("brain_alive_rows", [])),
+        tuple(int(x) for x in field_state.get("alive_brain_rows", [])),
+        bool(field_state.get("any_zombie_present", False)),
+        mode,
+    )
+
+
+def should_print_field_status(field_state):
+    mode = get_field_status_log_mode(field_state)
+
+    # 不打印冷却中 / grace 等中间状态
+    if mode == "silent":
+        return False
+
+    return True
+
 
 def main():
     config = load_config()
@@ -1506,6 +1572,14 @@ def main():
 
     print("Loading board corrector...")
     board_corrector = ThemeBoardCorrector(config)
+
+    print("Loading field status detector...")
+    field_status_detector = FieldStatusDetector(config)
+    field_state = None
+    last_field_status_signature = None
+    last_field_status_log_text = None
+    last_field_status_log_key = None
+
 
     strategy_cfg = config.get("strategy", {})
     strategy_enabled = strategy_cfg.get("enabled", True)
@@ -1675,9 +1749,12 @@ def main():
 
             now = time.time()
 
+            current_board_signature, board_plant_count = make_board_signature(cell_results)
+
+
             if theme_reset_on_round_change:
                 t0 = time.perf_counter()
-                board_signature, board_plant_count = make_board_signature(cell_results)
+                board_signature = current_board_signature
 
                 if locked_theme is not None and last_board_signature is not None:
                     changed_cells = count_signature_changes(
@@ -1715,8 +1792,44 @@ def main():
                         cached_blood_error_text = blood_import_error_text
                         cached_break_plan = None
 
+                        field_status_detector.reset()
+                        field_state = None
+                        last_field_status_signature = None
+                        last_field_status_log_text = None
+                        last_field_status_log_key = None
+
+
                 last_board_signature = board_signature
                 profiler.add("round_check", time.perf_counter() - t0)
+
+            else:
+                board_signature, board_plant_count = make_board_signature(cell_results)
+
+            # 更新全场状态：脑子是否存在 + 全场是否还有僵尸
+            t0 = time.perf_counter()
+            field_state = field_status_detector.update(
+                frame,
+                stability_signature=current_board_signature,
+            )
+            field_status_signature = field_status_detector.state_signature(field_state)
+
+            if field_status_signature != last_field_status_signature:
+                cached_break_plan = None
+                last_field_status_signature = field_status_signature
+
+            field_status_log_key = make_field_status_log_key(field_state)
+
+            if (
+                field_status_log_key != last_field_status_log_key
+                and should_print_field_status(field_state)
+            ):
+                field_status_log_text = format_field_status_log(field_state)
+                print(field_status_log_text)
+                last_field_status_log_text = field_status_log_text
+                last_field_status_log_key = field_status_log_key
+
+            profiler.add("field_status", time.perf_counter() - t0)
+
 
             theme_result = last_theme_result
 
@@ -1927,26 +2040,55 @@ def main():
                     try:
                         if cached_break_plan is None:
                             context = BreakContext(
-                                theme=strategy_theme,
-                                board_5x5=ize_board,
-                                board_5x9=(
-                                    cached_strategy_board
-                                    or extract_strategy_board(board, rows=5, cols=9)
-                                ),
-                                blood_table=blood_table,
-                                theme_result=theme_result,
-                                correction_info=correction_info,
-                                config=config,
-                            )
+                            theme=strategy_theme,
+                            board_5x5=ize_board,
+                            board_5x9=(
+                                cached_strategy_board
+                                or extract_strategy_board(board, rows=5, cols=9)
+                            ),
+                            blood_table=blood_table,
+                            theme_result=theme_result,
+                            correction_info=correction_info,
+
+                            # Field status: 脑子状态 + 全场僵尸状态 + 是否允许重新破阵
+                            field_state=field_state,
+                            brain_alive_rows=(
+                                field_state.get("brain_alive_rows")
+                                if isinstance(field_state, dict)
+                                else None
+                            ),
+                            alive_brain_rows=(
+                                field_state.get("alive_brain_rows")
+                                if isinstance(field_state, dict)
+                                else None
+                            ),
+                            any_zombie_present=(
+                                bool(field_state.get("any_zombie_present", False))
+                                if isinstance(field_state, dict)
+                                else False
+                            ),
+                            should_replan=(
+                                bool(field_state.get("should_replan", True))
+                                if isinstance(field_state, dict)
+                                else True
+                            ),
+
+                            config=config,
+                        )
+
+                        if not context.should_replan:
+                            cached_break_plan = None
+                        else:
                             cached_break_plan = strategy_router.solve(context)
 
-                        if strategy_log_plan:
+                        if cached_break_plan is not None and strategy_log_plan:
                             breaker_log_text = format_break_plan_log(cached_break_plan)
 
-                            if breaker_log_text != last_breaker_log_text:
+                            if breaker_log_text and breaker_log_text != last_breaker_log_text:
                                 print(breaker_log_text)
                                 last_breaker_log_text = breaker_log_text
                                 last_breaker_log_time = now
+
 
                     except Exception as e:
                         breaker_log_text = f"[Breaker] {type(e).__name__}: {e}"
@@ -1977,6 +2119,9 @@ def main():
                     cell_results,
                     show_confidence=True,
                 )
+
+                vis = field_status_detector.draw_debug(vis, field_state)
+
                 vis = draw_theme_overlay(
                     vis,
                     theme_result,
@@ -2009,6 +2154,13 @@ def main():
                 cached_blood_table = None
                 cached_blood_error_text = blood_import_error_text
                 cached_break_plan = None
+
+                field_status_detector.reset()
+                field_state = None
+                last_field_status_signature = None
+                last_field_status_log_text = None
+                last_field_status_log_key = None
+
 
                 print("[Theme] Reset locked theme.")
 
